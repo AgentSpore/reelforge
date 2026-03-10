@@ -12,6 +12,7 @@ class ReelJob(BaseModel):
     status: str
     output_url: Optional[str] = None
     duration_seconds: Optional[float] = None
+    render_log: Optional[dict] = None
     created_at: str
     completed_at: Optional[str] = None
 
@@ -53,3 +54,12 @@ class StatsResponse(BaseModel):
     avg_duration_seconds: float
     most_used_style: Optional[str]
     most_used_ratio: Optional[str]
+
+
+class RenderLogResponse(BaseModel):
+    job_id: int
+    status: str
+    render_log: Optional[dict]
+    output_url: Optional[str]
+    duration_seconds: Optional[float]
+    completed_at: Optional[str]
