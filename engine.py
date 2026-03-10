@@ -50,6 +50,12 @@ async def init_db(path: str) -> aiosqlite.Connection:
 
 
 def _job_row(r: aiosqlite.Row) -> dict:
+    render_log = None
+    if r["render_log"]:
+        try:
+            render_log = json.loads(r["render_log"])
+        except Exception:
+            pass
     return {
         "id": r["id"],
         "title": r["title"],
@@ -59,6 +65,7 @@ def _job_row(r: aiosqlite.Row) -> dict:
         "status": r["status"],
         "output_url": r["output_url"],
         "duration_seconds": r["duration_seconds"],
+        "render_log": render_log,
         "created_at": r["created_at"],
         "completed_at": r["completed_at"],
     }
@@ -102,12 +109,31 @@ async def get_job(db: aiosqlite.Connection, job_id: int) -> dict | None:
     return _job_row(rows[0]) if rows else None
 
 
+async def get_render_log(db: aiosqlite.Connection, job_id: int) -> dict | None:
+    rows = await db.execute_fetchall(
+        "SELECT id, status, render_log, output_url, duration_seconds, completed_at FROM reel_jobs WHERE id = ?",
+        (job_id,),
+    )
+    if not rows:
+        return None
+    r = rows[0]
+    render_log = None
+    if r["render_log"]:
+        try:
+            render_log = json.loads(r["render_log"])
+        except Exception:
+            pass
+    return {
+        "job_id": r["id"],
+        "status": r["status"],
+        "render_log": render_log,
+        "output_url": r["output_url"],
+        "duration_seconds": r["duration_seconds"],
+        "completed_at": r["completed_at"],
+    }
+
+
 async def process_job(db: aiosqlite.Connection, job_id: int):
-    """
-    Simulate reel rendering pipeline:
-    queued → processing → completed/failed
-    In production: call FFMPEG pipeline or video API (Shotstack, Creatomate, RunwayML).
-    """
     await db.execute("UPDATE reel_jobs SET status = 'processing' WHERE id = ?", (job_id,))
     await db.commit()
 
@@ -118,10 +144,8 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
     photos = json.loads(job["photo_urls"])
     style_cfg = STYLE_CATALOG.get(job["style"], STYLE_CATALOG["dynamic"])
 
-    # Simulate render time proportional to photo count
     await asyncio.sleep(0.5 + len(photos) * 0.2)
 
-    # Build render log
     log = {
         "photos_processed": len(photos),
         "style": job["style"],
@@ -132,7 +156,6 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
         "resolution": "1080x1920" if job["aspect_ratio"] == "9:16" else "1080x1080",
     }
 
-    # Mock output URL (in prod: upload to S3/CDN)
     output_url = f"https://cdn.reelforge.io/renders/{job_id}/output.mp4"
     duration = min(job["duration_target"], len(photos) * 3.5)
     now = datetime.now(timezone.utc).isoformat()
