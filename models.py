@@ -19,14 +19,25 @@ class ReelJob(BaseModel):
 
 class CreateReelRequest(BaseModel):
     title: str = Field(..., description="Product name or reel title")
-    photo_urls: list[str] = Field(..., min_length=1, max_length=10, description="URLs of product photos to include")
-    style: str = Field("dynamic", description="Style: dynamic | minimal | luxury | playful | cinematic")
-    aspect_ratio: str = Field("9:16", description="Output ratio: 9:16 (TikTok/Reels) | 1:1 (Instagram) | 16:9 (YouTube)")
-    caption: Optional[str] = Field(None, description="Optional caption text to overlay")
-    music_genre: Optional[str] = Field(None, description="Background music genre: upbeat | ambient | dramatic | none")
-    brand_color: Optional[str] = Field(None, description="Hex colour for brand overlay (e.g. #FF6B35)")
-    cta_text: Optional[str] = Field(None, description="Call-to-action text (e.g. Shop Now)")
-    duration_target: int = Field(15, ge=5, le=60, description="Target reel duration in seconds")
+    photo_urls: list[str] = Field(..., min_length=1, max_length=10)
+    style: str = Field("dynamic", description="dynamic | minimal | luxury | playful | cinematic")
+    aspect_ratio: str = Field("9:16", description="9:16 | 1:1 | 16:9")
+    caption: Optional[str] = None
+    music_genre: Optional[str] = None
+    brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
+    cta_text: Optional[str] = None
+    duration_target: int = Field(15, ge=5, le=60)
+
+
+class DuplicateReelRequest(BaseModel):
+    title: Optional[str] = Field(None, description="Override title (default: original + ' (copy)')")
+    style: Optional[str] = Field(None, description="Override style for A/B testing")
+    aspect_ratio: Optional[str] = None
+    caption: Optional[str] = None
+    music_genre: Optional[str] = None
+    brand_color: Optional[str] = None
+    cta_text: Optional[str] = None
+    duration_target: Optional[int] = Field(None, ge=5, le=60)
 
 
 class ReelListItem(BaseModel):
