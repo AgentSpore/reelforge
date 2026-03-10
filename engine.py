@@ -28,14 +28,14 @@ CREATE TABLE IF NOT EXISTS reel_jobs (
 """
 
 STYLE_CATALOG = {
-    "dynamic": {"description": "Fast cuts, energetic transitions", "best_for": "Sports, tech gadgets, fashion",
-                "transitions": ["zoom_in", "slide_left", "whip_pan", "flash"]},
-    "minimal": {"description": "Clean fades, lots of white space", "best_for": "Skincare, luxury goods, food",
-                "transitions": ["fade", "dissolve", "cross_fade"]},
-    "luxury":  {"description": "Slow pans, gold accents, elegant text", "best_for": "Jewellery, watches, premium brands",
-                "transitions": ["slow_zoom", "reveal", "iris_in"]},
-    "playful": {"description": "Bouncy animations, bright colours", "best_for": "Toys, lifestyle, gifts",
-                "transitions": ["bounce", "spin", "pop", "shake"]},
+    "dynamic":   {"description": "Fast cuts, energetic transitions", "best_for": "Sports, tech gadgets, fashion",
+                  "transitions": ["zoom_in", "slide_left", "whip_pan", "flash"]},
+    "minimal":   {"description": "Clean fades, lots of white space", "best_for": "Skincare, luxury goods, food",
+                  "transitions": ["fade", "dissolve", "cross_fade"]},
+    "luxury":    {"description": "Slow pans, gold accents, elegant text", "best_for": "Jewellery, watches, premium brands",
+                  "transitions": ["slow_zoom", "reveal", "iris_in"]},
+    "playful":   {"description": "Bouncy animations, bright colours", "best_for": "Toys, lifestyle, gifts",
+                  "transitions": ["bounce", "spin", "pop", "shake"]},
     "cinematic": {"description": "Letterbox bars, dramatic zoom, film grain", "best_for": "Perfumes, cars, fashion",
                   "transitions": ["letterbox_reveal", "slow_push", "ken_burns"]},
 }
@@ -57,17 +57,13 @@ def _job_row(r: aiosqlite.Row) -> dict:
         except Exception:
             pass
     return {
-        "id": r["id"],
-        "title": r["title"],
+        "id": r["id"], "title": r["title"],
         "photo_urls": json.loads(r["photo_urls"]),
-        "style": r["style"],
-        "aspect_ratio": r["aspect_ratio"],
-        "status": r["status"],
-        "output_url": r["output_url"],
+        "style": r["style"], "aspect_ratio": r["aspect_ratio"],
+        "status": r["status"], "output_url": r["output_url"],
         "duration_seconds": r["duration_seconds"],
         "render_log": render_log,
-        "created_at": r["created_at"],
-        "completed_at": r["completed_at"],
+        "created_at": r["created_at"], "completed_at": r["completed_at"],
     }
 
 
@@ -124,28 +120,22 @@ async def get_render_log(db: aiosqlite.Connection, job_id: int) -> dict | None:
         except Exception:
             pass
     return {
-        "job_id": r["id"],
-        "status": r["status"],
-        "render_log": render_log,
-        "output_url": r["output_url"],
-        "duration_seconds": r["duration_seconds"],
-        "completed_at": r["completed_at"],
+        "job_id": r["id"], "status": r["status"],
+        "render_log": render_log, "output_url": r["output_url"],
+        "duration_seconds": r["duration_seconds"], "completed_at": r["completed_at"],
     }
 
 
 async def process_job(db: aiosqlite.Connection, job_id: int):
     await db.execute("UPDATE reel_jobs SET status = 'processing' WHERE id = ?", (job_id,))
     await db.commit()
-
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (job_id,))
     if not rows:
         return
     job = rows[0]
     photos = json.loads(job["photo_urls"])
     style_cfg = STYLE_CATALOG.get(job["style"], STYLE_CATALOG["dynamic"])
-
     await asyncio.sleep(0.5 + len(photos) * 0.2)
-
     log = {
         "photos_processed": len(photos),
         "style": job["style"],
@@ -155,11 +145,9 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
         "brand_color": job["brand_color"] or "#000000",
         "resolution": "1080x1920" if job["aspect_ratio"] == "9:16" else "1080x1080",
     }
-
     output_url = f"https://cdn.reelforge.io/renders/{job_id}/output.mp4"
     duration = min(job["duration_target"], len(photos) * 3.5)
     now = datetime.now(timezone.utc).isoformat()
-
     await db.execute(
         """UPDATE reel_jobs SET status = 'completed', output_url = ?,
            duration_seconds = ?, render_log = ?, completed_at = ? WHERE id = ?""",
@@ -197,3 +185,55 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "most_used_style": max(style_counts, key=style_counts.get) if style_counts else None,
         "most_used_ratio": max(ratio_counts, key=ratio_counts.get) if ratio_counts else None,
     }
+
+
+async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (job_id,))
+    if not rows:
+        return None
+    src = rows[0]
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO reel_jobs
+           (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
+            cta_text, duration_target, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+        (
+            overrides.get("title") or f"{src['title']} (copy)",
+            src["photo_urls"],
+            overrides.get("style") or src["style"],
+            overrides.get("aspect_ratio") or src["aspect_ratio"],
+            overrides.get("caption") if "caption" in overrides else src["caption"],
+            overrides.get("music_genre") if "music_genre" in overrides else src["music_genre"],
+            overrides.get("brand_color") if "brand_color" in overrides else src["brand_color"],
+            overrides.get("cta_text") if "cta_text" in overrides else src["cta_text"],
+            overrides.get("duration_target") or src["duration_target"],
+            now,
+        )
+    )
+    await db.commit()
+    new_rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (cur.lastrowid,))
+    return _job_row(new_rows[0]) if new_rows else None
+
+
+async def get_stats_by_style(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM reel_jobs")
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        s = r["style"]
+        if s not in buckets:
+            buckets[s] = {"style": s, "total": 0, "completed": 0, "failed": 0, "durations": []}
+        buckets[s]["total"] += 1
+        if r["status"] == "completed":
+            buckets[s]["completed"] += 1
+        if r["status"] == "failed":
+            buckets[s]["failed"] += 1
+        if r["duration_seconds"]:
+            buckets[s]["durations"].append(r["duration_seconds"])
+    result = []
+    for b in buckets.values():
+        durs = b.pop("durations")
+        b["avg_duration_seconds"] = round(sum(durs) / len(durs), 1) if durs else 0.0
+        b["success_rate_pct"] = round(b["completed"] / b["total"] * 100, 1) if b["total"] else 0.0
+        result.append(b)
+    return sorted(result, key=lambda x: x["total"], reverse=True)
