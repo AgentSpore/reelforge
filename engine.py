@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS reel_jobs (
     brand_color TEXT,
     cta_text TEXT,
     duration_target INTEGER NOT NULL DEFAULT 15,
+    brand_id INTEGER,
     status TEXT NOT NULL DEFAULT 'queued',
     output_url TEXT,
     duration_seconds REAL,
@@ -25,7 +26,20 @@ CREATE TABLE IF NOT EXISTS reel_jobs (
     created_at TEXT NOT NULL,
     completed_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS brands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    brand_color TEXT,
+    logo_url TEXT,
+    default_cta TEXT,
+    default_music_genre TEXT,
+    default_style TEXT NOT NULL DEFAULT 'dynamic',
+    created_at TEXT NOT NULL
+);
 """
+
+MIGRATION_BRAND_ID = "ALTER TABLE reel_jobs ADD COLUMN brand_id INTEGER;"
 
 STYLE_CATALOG = {
     "dynamic":   {"description": "Fast cuts, energetic transitions", "best_for": "Sports, tech gadgets, fashion",
@@ -45,6 +59,13 @@ async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SQL)
+    try:
+        await db.execute("SELECT brand_id FROM reel_jobs LIMIT 1")
+    except Exception:
+        try:
+            await db.execute(MIGRATION_BRAND_ID)
+        except Exception:
+            pass
     await db.commit()
     return db
 
@@ -60,23 +81,111 @@ def _job_row(r: aiosqlite.Row) -> dict:
         "id": r["id"], "title": r["title"],
         "photo_urls": json.loads(r["photo_urls"]),
         "style": r["style"], "aspect_ratio": r["aspect_ratio"],
-        "status": r["status"], "output_url": r["output_url"],
+        "status": r["status"], "brand_id": r["brand_id"],
+        "output_url": r["output_url"],
         "duration_seconds": r["duration_seconds"],
         "render_log": render_log,
         "created_at": r["created_at"], "completed_at": r["completed_at"],
     }
 
 
+def _brand_row(r: aiosqlite.Row, reels_count: int = 0) -> dict:
+    return {
+        "id": r["id"], "name": r["name"],
+        "brand_color": r["brand_color"], "logo_url": r["logo_url"],
+        "default_cta": r["default_cta"], "default_music_genre": r["default_music_genre"],
+        "default_style": r["default_style"], "reels_count": reels_count,
+        "created_at": r["created_at"],
+    }
+
+
+async def get_brand(db: aiosqlite.Connection, brand_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM brands WHERE id = ?", (brand_id,))
+    if not rows:
+        return None
+    cnt = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM reel_jobs WHERE brand_id = ?", (brand_id,))
+    return _brand_row(rows[0], cnt[0]["c"] if cnt else 0)
+
+
+async def create_brand(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        """INSERT INTO brands (name, brand_color, logo_url, default_cta, default_music_genre, default_style, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (data["name"], data.get("brand_color"), data.get("logo_url"),
+         data.get("default_cta"), data.get("default_music_genre"),
+         data.get("default_style", "dynamic"), now)
+    )
+    await db.commit()
+    return await get_brand(db, cur.lastrowid)
+
+
+async def list_brands(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM brands ORDER BY name ASC")
+    result = []
+    for r in rows:
+        cnt = await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM reel_jobs WHERE brand_id = ?", (r["id"],))
+        result.append(_brand_row(r, cnt[0]["c"] if cnt else 0))
+    return result
+
+
+async def update_brand(db: aiosqlite.Connection, brand_id: int, updates: dict) -> dict | None:
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return await get_brand(db, brand_id)
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [brand_id]
+    cur = await db.execute(f"UPDATE brands SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_brand(db, brand_id)
+
+
+async def delete_brand(db: aiosqlite.Connection, brand_id: int) -> bool:
+    rows = await db.execute_fetchall("SELECT id FROM brands WHERE id = ?", (brand_id,))
+    if not rows:
+        return False
+    await db.execute("UPDATE reel_jobs SET brand_id = NULL WHERE brand_id = ?", (brand_id,))
+    await db.execute("DELETE FROM brands WHERE id = ?", (brand_id,))
+    await db.commit()
+    return True
+
+
+async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
+    """Apply brand profile defaults to reel creation data. Explicit values override brand defaults."""
+    brand_id = data.get("brand_id")
+    if not brand_id:
+        return data
+    brand = await get_brand(db, brand_id)
+    if not brand:
+        return data
+    # Only fill if user didn't provide explicit value
+    if not data.get("brand_color") and brand["brand_color"]:
+        data["brand_color"] = brand["brand_color"]
+    if not data.get("cta_text") and brand["default_cta"]:
+        data["cta_text"] = brand["default_cta"]
+    if not data.get("music_genre") and brand["default_music_genre"]:
+        data["music_genre"] = brand["default_music_genre"]
+    if data.get("style") == "dynamic" and brand["default_style"] != "dynamic":
+        data["style"] = brand["default_style"]
+    return data
+
+
 async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
+    data = await apply_brand_defaults(db, data)
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (data["title"], json.dumps(data["photo_urls"]), data.get("style", "dynamic"),
          data.get("aspect_ratio", "9:16"), data.get("caption"), data.get("music_genre"),
-         data.get("brand_color"), data.get("cta_text"), data.get("duration_target", 15), now)
+         data.get("brand_color"), data.get("cta_text"), data.get("duration_target", 15),
+         data.get("brand_id"), now)
     )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (cur.lastrowid,))
@@ -164,9 +273,12 @@ async def delete_job(db: aiosqlite.Connection, job_id: int) -> bool:
 
 async def get_stats(db: aiosqlite.Connection) -> dict:
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs")
+    brand_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM brands")
+    total_brands = brand_cnt[0]["c"] if brand_cnt else 0
     if not rows:
         return {"total_jobs": 0, "completed": 0, "processing": 0, "failed": 0,
-                "avg_duration_seconds": 0.0, "most_used_style": None, "most_used_ratio": None}
+                "avg_duration_seconds": 0.0, "most_used_style": None, "most_used_ratio": None,
+                "total_brands": total_brands}
     total = len(rows)
     completed = sum(1 for r in rows if r["status"] == "completed")
     processing = sum(1 for r in rows if r["status"] == "processing")
@@ -184,6 +296,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "avg_duration_seconds": avg_dur,
         "most_used_style": max(style_counts, key=style_counts.get) if style_counts else None,
         "most_used_ratio": max(ratio_counts, key=ratio_counts.get) if ratio_counts else None,
+        "total_brands": total_brands,
     }
 
 
@@ -196,8 +309,8 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (
             overrides.get("title") or f"{src['title']} (copy)",
             src["photo_urls"],
@@ -208,6 +321,7 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
             overrides.get("brand_color") if "brand_color" in overrides else src["brand_color"],
             overrides.get("cta_text") if "cta_text" in overrides else src["cta_text"],
             overrides.get("duration_target") or src["duration_target"],
+            src["brand_id"],
             now,
         )
     )
