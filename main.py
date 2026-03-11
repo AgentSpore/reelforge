@@ -8,11 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from models import (
     CreateReelRequest, DuplicateReelRequest, ReelJob, ReelListItem,
     StyleInfo, StatsResponse, RenderLogResponse,
+    BrandCreate, BrandUpdate, BrandResponse,
 )
 from engine import (
     init_db, create_job, list_jobs, get_job, get_render_log, process_job,
     delete_job, get_stats, STYLE_CATALOG,
     duplicate_job, get_stats_by_style,
+    create_brand, list_brands, get_brand, update_brand, delete_brand,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -28,7 +30,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ReelForge",
     description="Product photo to marketing reel generator. Submit photos, choose style, get a ready-to-post reel.",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -36,11 +38,52 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
+
+# ── Brands ───────────────────────────────────────────────────────────────
+
+@app.post("/brands", response_model=BrandResponse, status_code=201)
+async def add_brand(body: BrandCreate):
+    return await create_brand(app.state.db, body.model_dump())
+
+
+@app.get("/brands", response_model=list[BrandResponse])
+async def get_brands():
+    return await list_brands(app.state.db)
+
+
+@app.get("/brands/{brand_id}", response_model=BrandResponse)
+async def get_brand_detail(brand_id: int):
+    b = await get_brand(app.state.db, brand_id)
+    if not b:
+        raise HTTPException(404, "Brand not found")
+    return b
+
+
+@app.patch("/brands/{brand_id}", response_model=BrandResponse)
+async def patch_brand(brand_id: int, body: BrandUpdate):
+    b = await update_brand(app.state.db, brand_id, body.model_dump(exclude_unset=True))
+    if not b:
+        raise HTTPException(404, "Brand not found")
+    return b
+
+
+@app.delete("/brands/{brand_id}", status_code=204)
+async def remove_brand(brand_id: int):
+    ok = await delete_brand(app.state.db, brand_id)
+    if not ok:
+        raise HTTPException(404, "Brand not found")
+
+
+# ── Reels ────────────────────────────────────────────────────────────────
 
 @app.post("/reels", response_model=ReelJob, status_code=201)
 async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks):
+    if body.brand_id:
+        b = await get_brand(app.state.db, body.brand_id)
+        if not b:
+            raise HTTPException(404, "Brand not found")
     job = await create_job(app.state.db, body.model_dump())
     background_tasks.add_task(process_job, app.state.db, job["id"])
     return job
