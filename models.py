@@ -10,6 +10,7 @@ class ReelJob(BaseModel):
     style: str
     aspect_ratio: str
     status: str
+    brand_id: Optional[int] = None
     output_url: Optional[str] = None
     duration_seconds: Optional[float] = None
     render_log: Optional[dict] = None
@@ -22,6 +23,7 @@ class CreateReelRequest(BaseModel):
     photo_urls: list[str] = Field(..., min_length=1, max_length=10)
     style: str = Field("dynamic", description="dynamic | minimal | luxury | playful | cinematic")
     aspect_ratio: str = Field("9:16", description="9:16 | 1:1 | 16:9")
+    brand_id: Optional[int] = Field(None, description="Brand profile ID to auto-fill defaults")
     caption: Optional[str] = None
     music_genre: Optional[str] = None
     brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
@@ -50,6 +52,36 @@ class ReelListItem(BaseModel):
     created_at: str
 
 
+class BrandCreate(BaseModel):
+    name: str = Field(..., description="Brand name, e.g. 'Acme Corp'")
+    brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
+    logo_url: Optional[str] = None
+    default_cta: Optional[str] = None
+    default_music_genre: Optional[str] = None
+    default_style: str = Field("dynamic", description="Default reel style for this brand")
+
+
+class BrandUpdate(BaseModel):
+    name: Optional[str] = None
+    brand_color: Optional[str] = None
+    logo_url: Optional[str] = None
+    default_cta: Optional[str] = None
+    default_music_genre: Optional[str] = None
+    default_style: Optional[str] = None
+
+
+class BrandResponse(BaseModel):
+    id: int
+    name: str
+    brand_color: Optional[str]
+    logo_url: Optional[str]
+    default_cta: Optional[str]
+    default_music_genre: Optional[str]
+    default_style: str
+    reels_count: int
+    created_at: str
+
+
 class StyleInfo(BaseModel):
     name: str
     description: str
@@ -65,6 +97,7 @@ class StatsResponse(BaseModel):
     avg_duration_seconds: float
     most_used_style: Optional[str]
     most_used_ratio: Optional[str]
+    total_brands: int
 
 
 class RenderLogResponse(BaseModel):
