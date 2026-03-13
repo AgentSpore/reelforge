@@ -12,6 +12,7 @@ class ReelJob(BaseModel):
     status: str
     priority: str = "normal"
     brand_id: Optional[int] = None
+    render_profile_id: Optional[int] = None
     tags: list[str] = Field(default_factory=list)
     output_url: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -26,6 +27,7 @@ class CreateReelRequest(BaseModel):
     style: str = Field("dynamic", description="dynamic | minimal | luxury | playful | cinematic")
     aspect_ratio: str = Field("9:16", description="9:16 | 1:1 | 16:9")
     brand_id: Optional[int] = Field(None, description="Brand profile ID to auto-fill defaults")
+    render_profile_id: Optional[int] = Field(None, description="Render profile ID for quality settings")
     caption: Optional[str] = None
     music_genre: Optional[str] = None
     brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
@@ -41,6 +43,7 @@ class BatchCreateRequest(BaseModel):
     styles: list[str] = Field(..., min_length=1, max_length=5, description="List of styles to generate")
     aspect_ratio: str = Field("9:16", description="9:16 | 1:1 | 16:9")
     brand_id: Optional[int] = None
+    render_profile_id: Optional[int] = None
     caption: Optional[str] = None
     music_genre: Optional[str] = None
     brand_color: Optional[str] = None
@@ -463,3 +466,108 @@ class ShareLinkStats(BaseModel):
     total_views: int
     total_downloads: int
     most_shared_reels: list[dict]
+
+
+# -- Render Profiles (v1.0.0) -----------------------------------------------
+
+VALID_RESOLUTIONS = {"720p", "1080p", "1440p", "4k"}
+VALID_FPS = {24, 30, 60}
+VALID_CODECS = {"h264", "h265", "vp9", "av1"}
+VALID_QUALITY_PRESETS = {"draft", "balanced", "high", "ultra"}
+
+
+class RenderProfileCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    resolution: str = Field("1080p", description="720p | 1080p | 1440p | 4k")
+    fps: int = Field(30, description="24 | 30 | 60")
+    codec: str = Field("h264", description="h264 | h265 | vp9 | av1")
+    bitrate_kbps: int = Field(5000, ge=1000, le=50000)
+    quality_preset: str = Field("balanced", description="draft | balanced | high | ultra")
+    description: Optional[str] = None
+
+
+class RenderProfileUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    resolution: Optional[str] = None
+    fps: Optional[int] = None
+    codec: Optional[str] = None
+    bitrate_kbps: Optional[int] = Field(None, ge=1000, le=50000)
+    quality_preset: Optional[str] = None
+    description: Optional[str] = None
+
+
+class RenderProfileResponse(BaseModel):
+    id: int
+    name: str
+    resolution: str
+    fps: int
+    codec: str
+    bitrate_kbps: int
+    quality_preset: str
+    description: Optional[str]
+    created_at: str
+
+
+# -- Reel Versioning (v1.0.0) -----------------------------------------------
+
+class ReelVersionResponse(BaseModel):
+    id: int
+    reel_id: int
+    version_number: int
+    title: str
+    style: str
+    photo_urls: str  # JSON
+    render_settings: str  # JSON (resolution, fps, etc.)
+    output_url: Optional[str]
+    created_at: str
+    note: Optional[str]
+
+
+# -- Content Calendar (v1.0.0) ----------------------------------------------
+
+VALID_CALENDAR_STATUSES = {"planned", "assigned", "published", "skipped"}
+
+
+class CalendarSlotCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    planned_date: str = Field(..., description="ISO date YYYY-MM-DD")
+    platform: str = Field(..., description="instagram | tiktok | youtube | facebook")
+    reel_id: Optional[int] = None
+    notes: Optional[str] = None
+    status: str = Field("planned", description="planned | assigned | published | skipped")
+
+
+class CalendarSlotUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    planned_date: Optional[str] = None
+    platform: Optional[str] = None
+    reel_id: Optional[int] = None
+    notes: Optional[str] = None
+    status: Optional[str] = None
+
+
+class CalendarSlotResponse(BaseModel):
+    id: int
+    title: str
+    planned_date: str
+    platform: str
+    reel_id: Optional[int]
+    notes: Optional[str]
+    status: str
+    created_at: str
+    updated_at: Optional[str]
+
+
+class CalendarOverview(BaseModel):
+    month: str
+    total_slots: int
+    slots_per_platform: dict
+    slots_per_day: dict
+    gap_days: list[str]
+    total_days: int
+    coverage_pct: float
+
+
+class CalendarGap(BaseModel):
+    date: str
+    missing_platforms: list[str]
