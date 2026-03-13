@@ -54,6 +54,54 @@ STYLE_CATALOG = {
                   "transitions": ["letterbox_reveal", "slow_push", "ken_burns"]},
 }
 
+REEL_PRESETS = {
+    "product_showcase": {
+        "description": "Classic product showcase — hero shot, features, CTA",
+        "recommended_photos": 4,
+        "recommended_style": "dynamic",
+        "recommended_aspect": "9:16",
+        "recommended_duration": 15,
+        "recommended_music": "upbeat",
+        "scene_flow": ["hero_shot", "feature_1", "feature_2", "cta"],
+    },
+    "unboxing": {
+        "description": "Unboxing experience — packaging, reveal, product, reaction",
+        "recommended_photos": 5,
+        "recommended_style": "playful",
+        "recommended_aspect": "9:16",
+        "recommended_duration": 20,
+        "recommended_music": "energetic",
+        "scene_flow": ["package_exterior", "opening", "reveal", "product_detail", "reaction"],
+    },
+    "before_after": {
+        "description": "Before/after transformation — great for beauty, cleaning, renovation",
+        "recommended_photos": 4,
+        "recommended_style": "minimal",
+        "recommended_aspect": "9:16",
+        "recommended_duration": 12,
+        "recommended_music": "dramatic",
+        "scene_flow": ["before_wide", "before_close", "after_close", "after_wide"],
+    },
+    "tutorial": {
+        "description": "Step-by-step tutorial or how-to guide",
+        "recommended_photos": 6,
+        "recommended_style": "minimal",
+        "recommended_aspect": "9:16",
+        "recommended_duration": 30,
+        "recommended_music": "calm",
+        "scene_flow": ["intro", "step_1", "step_2", "step_3", "result", "cta"],
+    },
+    "testimonial": {
+        "description": "Customer testimonial — quote, product, social proof",
+        "recommended_photos": 3,
+        "recommended_style": "luxury",
+        "recommended_aspect": "1:1",
+        "recommended_duration": 10,
+        "recommended_music": "ambient",
+        "scene_flow": ["quote", "product_in_use", "social_proof"],
+    },
+}
+
 
 async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
@@ -66,8 +114,23 @@ async def init_db(path: str) -> aiosqlite.Connection:
             await db.execute(MIGRATION_BRAND_ID)
         except Exception:
             pass
+    await _migrate_engagement(db)
     await db.commit()
     return db
+
+
+async def _migrate_engagement(db: aiosqlite.Connection):
+    """Create engagement_events table if it doesn't exist."""
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS engagement_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reel_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            source TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (reel_id) REFERENCES reel_jobs(id) ON DELETE CASCADE
+        )
+    """)
 
 
 def _job_row(r: aiosqlite.Row) -> dict:
@@ -402,3 +465,124 @@ async def get_daily_analytics(db: aiosqlite.Connection, days: int = 30) -> list[
         b["top_style"] = max(styles, key=styles.get) if styles else None
         result.append(b)
     return result
+
+
+# ── Engagement Tracking ────────────────────────────────────────────────────
+
+VALID_ENGAGEMENT_TYPES = {"view", "like", "share", "click", "save"}
+
+
+async def record_engagement(db: aiosqlite.Connection, reel_id: int,
+                            event_type: str, source: str | None = None) -> dict | None:
+    """Record an engagement event for a reel. Returns updated engagement summary."""
+    rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not rows:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO engagement_events (reel_id, event_type, source, created_at) VALUES (?, ?, ?, ?)",
+        (reel_id, event_type, source, now),
+    )
+    await db.commit()
+    return await get_reel_engagement(db, reel_id)
+
+
+async def get_reel_engagement(db: aiosqlite.Connection, reel_id: int) -> dict | None:
+    """Get engagement summary for a reel: counts per event type + totals."""
+    rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not rows:
+        return None
+    events = await db.execute_fetchall(
+        "SELECT event_type, COUNT(*) as cnt FROM engagement_events WHERE reel_id = ? GROUP BY event_type",
+        (reel_id,),
+    )
+    counts = {et: 0 for et in VALID_ENGAGEMENT_TYPES}
+    total = 0
+    for e in events:
+        counts[e["event_type"]] = e["cnt"]
+        total += e["cnt"]
+    # Engagement rate: (likes + shares + saves + clicks) / views * 100
+    views = counts.get("view", 0)
+    interactions = counts.get("like", 0) + counts.get("share", 0) + counts.get("save", 0) + counts.get("click", 0)
+    engagement_rate = round(interactions / views * 100, 1) if views > 0 else 0.0
+    return {
+        "reel_id": reel_id,
+        "views": counts["view"],
+        "likes": counts["like"],
+        "shares": counts["share"],
+        "clicks": counts["click"],
+        "saves": counts["save"],
+        "total_events": total,
+        "engagement_rate": engagement_rate,
+    }
+
+
+async def get_engagement_analytics(db: aiosqlite.Connection, limit: int = 20,
+                                   sort_by: str = "engagement_rate") -> list[dict]:
+    """Top performing reels ranked by engagement metrics."""
+    reel_ids = await db.execute_fetchall(
+        "SELECT DISTINCT reel_id FROM engagement_events"
+    )
+    results = []
+    for row in reel_ids:
+        rid = row["reel_id"]
+        eng = await get_reel_engagement(db, rid)
+        if eng:
+            job = await get_job(db, rid)
+            if job:
+                eng["title"] = job["title"]
+                eng["style"] = job["style"]
+                eng["status"] = job["status"]
+                results.append(eng)
+    valid_sorts = {"engagement_rate", "views", "likes", "shares", "clicks", "saves", "total_events"}
+    if sort_by not in valid_sorts:
+        sort_by = "engagement_rate"
+    results.sort(key=lambda x: x.get(sort_by, 0), reverse=True)
+    return results[:limit]
+
+
+# ── Brand Analytics ────────────────────────────────────────────────────────
+
+async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
+    """Per-brand performance breakdown: reels, completion rate, avg render time, top style."""
+    brands = await db.execute_fetchall("SELECT * FROM brands ORDER BY name ASC")
+    results = []
+    for b in brands:
+        bid = b["id"]
+        reels = await db.execute_fetchall(
+            "SELECT * FROM reel_jobs WHERE brand_id = ?", (bid,)
+        )
+        total = len(reels)
+        completed = sum(1 for r in reels if r["status"] == "completed")
+        failed = sum(1 for r in reels if r["status"] == "failed")
+        durations = [r["duration_seconds"] for r in reels if r["duration_seconds"]]
+        avg_dur = round(sum(durations) / len(durations), 1) if durations else 0.0
+        completion_rate = round(completed / total * 100, 1) if total else 0.0
+        style_counts: dict[str, int] = {}
+        for r in reels:
+            style_counts[r["style"]] = style_counts.get(r["style"], 0) + 1
+        top_style = max(style_counts, key=style_counts.get) if style_counts else None
+        # Engagement totals for brand
+        engagement = await db.execute_fetchall(
+            """SELECT event_type, COUNT(*) as cnt
+               FROM engagement_events WHERE reel_id IN (SELECT id FROM reel_jobs WHERE brand_id = ?)
+               GROUP BY event_type""",
+            (bid,),
+        )
+        eng_counts = {e["event_type"]: e["cnt"] for e in engagement}
+        total_views = eng_counts.get("view", 0)
+        total_interactions = sum(eng_counts.get(t, 0) for t in ["like", "share", "save", "click"])
+        eng_rate = round(total_interactions / total_views * 100, 1) if total_views > 0 else 0.0
+        results.append({
+            "brand_id": bid,
+            "brand_name": b["name"],
+            "total_reels": total,
+            "completed": completed,
+            "failed": failed,
+            "completion_rate": completion_rate,
+            "avg_duration_seconds": avg_dur,
+            "top_style": top_style,
+            "total_views": total_views,
+            "engagement_rate": eng_rate,
+        })
+    return results
