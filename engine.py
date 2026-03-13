@@ -4,6 +4,7 @@ import json
 import random
 import hashlib
 import hmac
+import secrets
 from datetime import datetime, timezone, timedelta
 
 import aiosqlite
@@ -109,6 +110,17 @@ REEL_PRESETS = {
 
 VALID_PLATFORMS = {"instagram", "tiktok", "youtube", "facebook"}
 
+VALID_TEMPLATE_CATEGORIES = {
+    "product", "lifestyle", "tutorial", "testimonial",
+    "announcement", "seasonal", "promotion", "general",
+}
+
+SHARE_BASE_URL = "https://reelforge.io/share"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
@@ -128,6 +140,9 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _migrate_tags(db)
     await _migrate_webhooks(db)
     await _migrate_scheduled(db)
+    await _migrate_templates(db)
+    await _migrate_comments(db)
+    await _migrate_share_links(db)
     await db.commit()
     return db
 
@@ -240,7 +255,68 @@ async def _migrate_scheduled(db: aiosqlite.Connection):
     """)
 
 
-# ── Row helpers ────────────────────────────────────────────────────────────
+async def _migrate_templates(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            source_reel_id INTEGER,
+            style TEXT NOT NULL DEFAULT 'dynamic',
+            aspect_ratio TEXT NOT NULL DEFAULT '9:16',
+            music_genre TEXT,
+            brand_color TEXT,
+            cta_text TEXT,
+            duration_target INTEGER NOT NULL DEFAULT 15,
+            brand_id INTEGER,
+            category TEXT NOT NULL DEFAULT 'general',
+            times_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_templates_category ON templates(category);
+        CREATE INDEX IF NOT EXISTS idx_templates_brand ON templates(brand_id);
+    """)
+
+
+async def _migrate_comments(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS reel_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reel_id INTEGER NOT NULL REFERENCES reel_jobs(id) ON DELETE CASCADE,
+            author TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_resolved INTEGER NOT NULL DEFAULT 0,
+            parent_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT,
+            FOREIGN KEY (parent_id) REFERENCES reel_comments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_comments_reel ON reel_comments(reel_id);
+        CREATE INDEX IF NOT EXISTS idx_comments_parent ON reel_comments(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_comments_author ON reel_comments(author);
+    """)
+
+
+async def _migrate_share_links(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS share_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reel_id INTEGER NOT NULL REFERENCES reel_jobs(id) ON DELETE CASCADE,
+            token TEXT NOT NULL UNIQUE,
+            expires_at TEXT,
+            password_hash TEXT,
+            allow_download INTEGER NOT NULL DEFAULT 1,
+            view_count INTEGER NOT NULL DEFAULT 0,
+            download_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_accessed_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_share_token ON share_links(token);
+        CREATE INDEX IF NOT EXISTS idx_share_reel ON share_links(reel_id);
+    """)
+
+
+# -- Row helpers -------------------------------------------------------------
 
 def _job_row(r: aiosqlite.Row, tags: list[str] | None = None) -> dict:
     render_log = None
@@ -284,7 +360,64 @@ async def _get_reel_tags(db: aiosqlite.Connection, reel_id: int) -> list[str]:
     return [r["tag"] for r in rows]
 
 
-# ── Brands ─────────────────────────────────────────────────────────────────
+def _template_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "description": r["description"],
+        "source_reel_id": r["source_reel_id"],
+        "style": r["style"],
+        "aspect_ratio": r["aspect_ratio"],
+        "music_genre": r["music_genre"],
+        "brand_color": r["brand_color"],
+        "cta_text": r["cta_text"],
+        "duration_target": r["duration_target"],
+        "brand_id": r["brand_id"],
+        "category": r["category"],
+        "times_used": r["times_used"],
+        "created_at": r["created_at"],
+    }
+
+
+def _comment_row(r: aiosqlite.Row, replies_count: int = 0) -> dict:
+    return {
+        "id": r["id"],
+        "reel_id": r["reel_id"],
+        "author": r["author"],
+        "content": r["content"],
+        "is_resolved": bool(r["is_resolved"]),
+        "parent_id": r["parent_id"],
+        "replies_count": replies_count,
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
+def _share_link_row(r: aiosqlite.Row) -> dict:
+    expires_at = r["expires_at"]
+    is_expired = False
+    if expires_at:
+        try:
+            exp_dt = datetime.fromisoformat(expires_at)
+            is_expired = datetime.now(timezone.utc) > exp_dt
+        except (ValueError, TypeError):
+            pass
+    return {
+        "id": r["id"],
+        "reel_id": r["reel_id"],
+        "token": r["token"],
+        "expires_at": expires_at,
+        "allow_download": bool(r["allow_download"]),
+        "view_count": r["view_count"],
+        "download_count": r["download_count"],
+        "is_expired": is_expired,
+        "share_url": f"{SHARE_BASE_URL}/{r['token']}",
+        "created_at": r["created_at"],
+        "last_accessed_at": r["last_accessed_at"],
+    }
+
+
+# -- Brands ------------------------------------------------------------------
 
 async def get_brand(db: aiosqlite.Connection, brand_id: int) -> dict | None:
     rows = await db.execute_fetchall("SELECT * FROM brands WHERE id = ?", (brand_id,))
@@ -296,7 +429,7 @@ async def get_brand(db: aiosqlite.Connection, brand_id: int) -> dict | None:
 
 
 async def create_brand(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO brands (name, brand_color, logo_url, default_cta, default_music_genre, default_style, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -359,14 +492,14 @@ async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
     return data
 
 
-# ── Reel Jobs ──────────────────────────────────────────────────────────────
+# -- Reel Jobs ---------------------------------------------------------------
 
 async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
     data = await apply_brand_defaults(db, data)
     priority = data.get("priority", "normal")
     if priority not in VALID_PRIORITIES:
         priority = "normal"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
@@ -519,7 +652,7 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
     }
     output_url = f"https://cdn.reelforge.io/renders/{job_id}/output.mp4"
     duration = min(job["duration_target"], len(photos) * 3.5)
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         """UPDATE reel_jobs SET status = 'completed', output_url = ?,
            duration_seconds = ?, render_log = ?, completed_at = ? WHERE id = ?""",
@@ -589,7 +722,7 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
     if not rows:
         return None
     src = rows[0]
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     priority = "normal"
     try:
         priority = src["priority"] or "normal"
@@ -679,7 +812,7 @@ async def get_daily_analytics(db: aiosqlite.Connection, days: int = 30) -> list[
     return result
 
 
-# ── Engagement Tracking ────────────────────────────────────────────────────
+# -- Engagement Tracking ----------------------------------------------------
 
 VALID_ENGAGEMENT_TYPES = {"view", "like", "share", "click", "save"}
 
@@ -689,7 +822,7 @@ async def record_engagement(db: aiosqlite.Connection, reel_id: int,
     rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
     if not rows:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "INSERT INTO engagement_events (reel_id, event_type, source, created_at) VALUES (?, ?, ?, ?)",
         (reel_id, event_type, source, now),
@@ -749,7 +882,7 @@ async def get_engagement_analytics(db: aiosqlite.Connection, limit: int = 20,
     return results[:limit]
 
 
-# ── Brand Analytics ────────────────────────────────────────────────────────
+# -- Brand Analytics ---------------------------------------------------------
 
 async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
     brands = await db.execute_fetchall("SELECT * FROM brands ORDER BY name ASC")
@@ -794,10 +927,10 @@ async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
     return results
 
 
-# ── Collections ────────────────────────────────────────────────────────────
+# -- Collections -------------------------------------------------------------
 
 async def create_collection(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO collections (name, description, created_at) VALUES (?, ?, ?)",
         (data["name"], data.get("description"), now),
@@ -849,7 +982,7 @@ async def add_reel_to_collection(db: aiosqlite.Connection, collection_id: int, r
     reel = await get_job(db, reel_id)
     if not reel:
         return "reel_not_found"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         await db.execute(
             "INSERT INTO collection_reels (collection_id, reel_id, added_at) VALUES (?, ?, ?)",
@@ -925,7 +1058,7 @@ async def get_collection_analytics(db: aiosqlite.Connection, collection_id: int)
     }
 
 
-# ── A/B Tests ──────────────────────────────────────────────────────────────
+# -- A/B Tests ---------------------------------------------------------------
 
 async def create_ab_test(db: aiosqlite.Connection, data: dict) -> dict | str:
     reel_ids = data["reel_ids"]
@@ -933,7 +1066,7 @@ async def create_ab_test(db: aiosqlite.Connection, data: dict) -> dict | str:
         reel = await get_job(db, rid)
         if not reel:
             return f"reel_not_found:{rid}"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO ab_tests (name, created_at) VALUES (?, ?)",
         (data["name"], now),
@@ -1012,7 +1145,7 @@ async def complete_ab_test(db: aiosqlite.Connection, test_id: int) -> dict | Non
     return await get_ab_test(db, test_id)
 
 
-# ── Render Queue ───────────────────────────────────────────────────────────
+# -- Render Queue ------------------------------------------------------------
 
 async def get_render_queue(db: aiosqlite.Connection) -> list[dict]:
     rows = await db.execute_fetchall(
@@ -1036,14 +1169,14 @@ async def get_render_queue(db: aiosqlite.Connection) -> list[dict]:
     return result
 
 
-# ── Tags ────────────────────────────────────────────────────────────────────
+# -- Tags --------------------------------------------------------------------
 
 async def add_tag(db: aiosqlite.Connection, reel_id: int, tag: str) -> list[str] | None:
     rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
     if not rows:
         return None
     tag = tag.strip().lower()
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         await db.execute(
             "INSERT INTO reel_tags (reel_id, tag, created_at) VALUES (?, ?, ?)",
@@ -1105,10 +1238,10 @@ async def get_tag_analytics(db: aiosqlite.Connection, tag: str) -> dict | None:
     }
 
 
-# ── Webhooks ────────────────────────────────────────────────────────────────
+# -- Webhooks ----------------------------------------------------------------
 
 async def create_webhook(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     events_json = json.dumps(data["events"])
     cur = await db.execute(
         "INSERT INTO webhooks (url, events, secret, created_at) VALUES (?, ?, ?, ?)",
@@ -1173,7 +1306,7 @@ async def _fire_webhooks(db: aiosqlite.Connection, event: str, payload: dict):
     """Fire all matching webhooks (best-effort, no actual HTTP in MVP)."""
     rows = await db.execute_fetchall(
         "SELECT * FROM webhooks WHERE is_active = 1")
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     for r in rows:
         try:
             events = json.loads(r["events"])
@@ -1188,7 +1321,7 @@ async def _fire_webhooks(db: aiosqlite.Connection, event: str, payload: dict):
     await db.commit()
 
 
-# ── Scheduled Publishing ──────────────────────────────────────────────────
+# -- Scheduled Publishing ---------------------------------------------------
 
 async def schedule_publish(db: aiosqlite.Connection, reel_id: int, data: dict) -> dict | str | None:
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (reel_id,))
@@ -1201,7 +1334,7 @@ async def schedule_publish(db: aiosqlite.Connection, reel_id: int, data: dict) -
     # Check reel is completed
     if reel["status"] != "completed":
         return "not_completed"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     try:
         cur = await db.execute(
             """INSERT INTO scheduled_publishes (reel_id, publish_at, platform, caption, created_at)
@@ -1258,3 +1391,504 @@ async def cancel_schedule(db: aiosqlite.Connection, reel_id: int, platform: str 
             (reel_id,))
     await db.commit()
     return cur.rowcount > 0
+
+
+# -- Reel Templates (v0.9.0) ------------------------------------------------
+
+async def create_template(db: aiosqlite.Connection, data: dict) -> dict | str | None:
+    """Create a reusable reel template, optionally copying settings from an existing reel."""
+    category = data.get("category", "general")
+    if category not in VALID_TEMPLATE_CATEGORIES:
+        return "invalid_category"
+
+    source_reel_id = data.get("source_reel_id")
+    style = data.get("style", "dynamic")
+    aspect_ratio = data.get("aspect_ratio", "9:16")
+    music_genre = data.get("music_genre")
+    brand_color = data.get("brand_color")
+    cta_text = data.get("cta_text")
+    duration_target = data.get("duration_target", 15)
+    brand_id = data.get("brand_id")
+
+    # If source_reel_id provided, copy settings from that reel
+    if source_reel_id is not None:
+        reel = await get_job(db, source_reel_id)
+        if not reel:
+            return "reel_not_found"
+        # Copy reel settings, but allow explicit overrides
+        if data.get("style") is None:
+            style = reel["style"]
+        if data.get("aspect_ratio") is None:
+            aspect_ratio = reel["aspect_ratio"]
+        if data.get("brand_id") is None:
+            brand_id = reel.get("brand_id")
+        # For optional fields, only copy from reel if not explicitly provided
+        if "music_genre" not in data or data["music_genre"] is None:
+            # Try to get music_genre from render_log
+            if reel.get("render_log") and isinstance(reel["render_log"], dict):
+                music_genre = reel["render_log"].get("audio_track")
+                if music_genre == "none":
+                    music_genre = None
+        if "brand_color" not in data or data["brand_color"] is None:
+            if reel.get("render_log") and isinstance(reel["render_log"], dict):
+                bc = reel["render_log"].get("brand_color")
+                if bc and bc != "#000000":
+                    brand_color = bc
+        if "cta_text" not in data or data["cta_text"] is None:
+            if reel.get("render_log") and isinstance(reel["render_log"], dict):
+                cta_text = reel["render_log"].get("cta") or None
+        if data.get("duration_target") is None and reel.get("duration_seconds"):
+            duration_target = int(reel["duration_seconds"])
+
+    # Validate style
+    if style not in STYLE_CATALOG:
+        return "invalid_style"
+
+    # Validate brand_id if provided
+    if brand_id is not None:
+        brand = await get_brand(db, brand_id)
+        if not brand:
+            return "brand_not_found"
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO templates
+           (name, description, source_reel_id, style, aspect_ratio, music_genre,
+            brand_color, cta_text, duration_target, brand_id, category, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data["name"], data.get("description"), source_reel_id, style,
+         aspect_ratio, music_genre, brand_color, cta_text,
+         duration_target, brand_id, category, now),
+    )
+    await db.commit()
+    return await get_template(db, cur.lastrowid)
+
+
+async def get_template(db: aiosqlite.Connection, template_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM templates WHERE id = ?", (template_id,))
+    if not rows:
+        return None
+    return _template_row(rows[0])
+
+
+async def list_templates(db: aiosqlite.Connection, category: str | None = None,
+                         brand_id: int | None = None) -> list[dict]:
+    q = "SELECT * FROM templates"
+    params: list = []
+    conditions = []
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+    if brand_id is not None:
+        conditions.append("brand_id = ?")
+        params.append(brand_id)
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
+    q += " ORDER BY times_used DESC, created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_template_row(r) for r in rows]
+
+
+async def update_template(db: aiosqlite.Connection, template_id: int, updates: dict) -> dict | str | None:
+    existing = await get_template(db, template_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    # Validate category if being updated
+    if "category" in fields and fields["category"] not in VALID_TEMPLATE_CATEGORIES:
+        return "invalid_category"
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [template_id]
+    cur = await db.execute(f"UPDATE templates SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_template(db, template_id)
+
+
+async def delete_template(db: aiosqlite.Connection, template_id: int) -> bool:
+    cur = await db.execute("DELETE FROM templates WHERE id = ?", (template_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def create_reel_from_template(db: aiosqlite.Connection, template_id: int, data: dict) -> dict | str | None:
+    """Create a reel job using a template's settings, then increment times_used."""
+    template = await get_template(db, template_id)
+    if not template:
+        return None
+
+    priority = data.get("priority", "normal")
+    if priority not in VALID_PRIORITIES:
+        return "invalid_priority"
+
+    job_data = {
+        "title": data["title"],
+        "photo_urls": data["photo_urls"],
+        "style": template["style"],
+        "aspect_ratio": template["aspect_ratio"],
+        "caption": data.get("caption"),
+        "music_genre": template["music_genre"],
+        "brand_color": template["brand_color"],
+        "cta_text": template["cta_text"],
+        "duration_target": template["duration_target"],
+        "brand_id": template["brand_id"],
+        "priority": priority,
+        "tags": data.get("tags", []),
+    }
+    job = await create_job(db, job_data)
+
+    # Increment times_used
+    await db.execute(
+        "UPDATE templates SET times_used = times_used + 1 WHERE id = ?", (template_id,))
+    await db.commit()
+
+    return job
+
+
+# -- Reel Comments / Collaboration (v0.9.0) ---------------------------------
+
+async def add_comment(db: aiosqlite.Connection, reel_id: int, data: dict) -> dict | str | None:
+    """Add a comment to a reel. Supports threaded replies via parent_id."""
+    # Validate reel exists
+    reel = await get_job(db, reel_id)
+    if not reel:
+        return None
+
+    parent_id = data.get("parent_id")
+    if parent_id is not None:
+        # Validate parent comment exists and belongs to same reel
+        parent_rows = await db.execute_fetchall(
+            "SELECT * FROM reel_comments WHERE id = ?", (parent_id,))
+        if not parent_rows:
+            return "parent_not_found"
+        if parent_rows[0]["reel_id"] != reel_id:
+            return "parent_wrong_reel"
+        # Don't allow nested replies (only one level of threading)
+        if parent_rows[0]["parent_id"] is not None:
+            return "nested_reply_not_allowed"
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO reel_comments (reel_id, author, content, parent_id, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (reel_id, data["author"], data["content"], parent_id, now),
+    )
+    await db.commit()
+    return await get_comment(db, cur.lastrowid)
+
+
+async def get_comment(db: aiosqlite.Connection, comment_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM reel_comments WHERE id = ?", (comment_id,))
+    if not rows:
+        return None
+    # Count replies
+    reply_cnt = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM reel_comments WHERE parent_id = ?", (comment_id,))
+    count = reply_cnt[0]["c"] if reply_cnt else 0
+    return _comment_row(rows[0], count)
+
+
+async def list_comments(db: aiosqlite.Connection, reel_id: int,
+                        author: str | None = None,
+                        is_resolved: bool | None = None) -> list[dict]:
+    """List top-level comments for a reel with reply counts. Filters by author and resolved status."""
+    # Validate reel exists
+    reel_rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not reel_rows:
+        return None  # type: ignore[return-value]
+
+    q = "SELECT * FROM reel_comments WHERE reel_id = ? AND parent_id IS NULL"
+    params: list = [reel_id]
+    if author:
+        q += " AND author = ?"
+        params.append(author)
+    if is_resolved is not None:
+        q += " AND is_resolved = ?"
+        params.append(int(is_resolved))
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    result = []
+    for r in rows:
+        reply_cnt = await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM reel_comments WHERE parent_id = ?", (r["id"],))
+        count = reply_cnt[0]["c"] if reply_cnt else 0
+        result.append(_comment_row(r, count))
+    return result
+
+
+async def update_comment(db: aiosqlite.Connection, comment_id: int, updates: dict) -> dict | None:
+    existing = await get_comment(db, comment_id)
+    if not existing:
+        return None
+    fields = {}
+    if "content" in updates and updates["content"] is not None:
+        fields["content"] = updates["content"]
+    if "is_resolved" in updates and updates["is_resolved"] is not None:
+        fields["is_resolved"] = int(updates["is_resolved"])
+    if not fields:
+        return existing
+    fields["updated_at"] = _now()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [comment_id]
+    await db.execute(f"UPDATE reel_comments SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    return await get_comment(db, comment_id)
+
+
+async def delete_comment(db: aiosqlite.Connection, comment_id: int) -> bool:
+    """Delete a comment and cascade-delete its replies."""
+    rows = await db.execute_fetchall("SELECT id FROM reel_comments WHERE id = ?", (comment_id,))
+    if not rows:
+        return False
+    # Delete replies first
+    await db.execute("DELETE FROM reel_comments WHERE parent_id = ?", (comment_id,))
+    # Delete the comment itself
+    await db.execute("DELETE FROM reel_comments WHERE id = ?", (comment_id,))
+    await db.commit()
+    return True
+
+
+async def resolve_comment(db: aiosqlite.Connection, comment_id: int) -> dict | None:
+    """Mark a comment as resolved."""
+    existing = await get_comment(db, comment_id)
+    if not existing:
+        return None
+    now = _now()
+    await db.execute(
+        "UPDATE reel_comments SET is_resolved = 1, updated_at = ? WHERE id = ?",
+        (now, comment_id))
+    await db.commit()
+    return await get_comment(db, comment_id)
+
+
+async def get_comment_stats(db: aiosqlite.Connection) -> dict:
+    """Get global comment statistics: totals, resolved/unresolved, top commenters."""
+    total_row = await db.execute_fetchall("SELECT COUNT(*) as c FROM reel_comments")
+    total = total_row[0]["c"] if total_row else 0
+
+    resolved_row = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM reel_comments WHERE is_resolved = 1")
+    resolved = resolved_row[0]["c"] if resolved_row else 0
+
+    unresolved = total - resolved
+
+    top_commenters_rows = await db.execute_fetchall(
+        """SELECT author, COUNT(*) as comment_count
+           FROM reel_comments
+           GROUP BY author
+           ORDER BY comment_count DESC
+           LIMIT 10""")
+    top_commenters = [
+        {"author": r["author"], "comment_count": r["comment_count"]}
+        for r in top_commenters_rows
+    ]
+
+    return {
+        "total_comments": total,
+        "resolved": resolved,
+        "unresolved": unresolved,
+        "top_commenters": top_commenters,
+    }
+
+
+# -- Export & Share Links (v0.9.0) -------------------------------------------
+
+def _hash_password(password: str) -> str:
+    """Hash a password using SHA-256."""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+async def create_share_link(db: aiosqlite.Connection, reel_id: int, data: dict) -> dict | str | None:
+    """Generate a shareable link for a reel with optional expiry and password protection."""
+    # Validate reel exists
+    reel = await get_job(db, reel_id)
+    if not reel:
+        return None
+
+    # Only allow sharing completed reels
+    if reel["status"] != "completed":
+        return "not_completed"
+
+    now = _now()
+    token = secrets.token_urlsafe(32)
+
+    expires_in_hours = data.get("expires_in_hours", 72)
+    expires_at = None
+    if expires_in_hours is not None:
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).isoformat()
+
+    password_hash = None
+    if data.get("password"):
+        password_hash = _hash_password(data["password"])
+
+    allow_download = data.get("allow_download", True)
+
+    cur = await db.execute(
+        """INSERT INTO share_links
+           (reel_id, token, expires_at, password_hash, allow_download, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (reel_id, token, expires_at, password_hash, int(allow_download), now),
+    )
+    await db.commit()
+    return await _get_share_link_by_id(db, cur.lastrowid)
+
+
+async def _get_share_link_by_id(db: aiosqlite.Connection, link_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM share_links WHERE id = ?", (link_id,))
+    if not rows:
+        return None
+    return _share_link_row(rows[0])
+
+
+async def list_share_links(db: aiosqlite.Connection, reel_id: int) -> list[dict] | None:
+    """List all share links for a reel."""
+    # Validate reel exists
+    reel_rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not reel_rows:
+        return None
+    rows = await db.execute_fetchall(
+        "SELECT * FROM share_links WHERE reel_id = ? ORDER BY created_at DESC", (reel_id,))
+    return [_share_link_row(r) for r in rows]
+
+
+async def get_share_link_by_token(db: aiosqlite.Connection, token: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM share_links WHERE token = ?", (token,))
+    if not rows:
+        return None
+    return _share_link_row(rows[0])
+
+
+async def access_share_link(db: aiosqlite.Connection, token: str, password: str | None = None) -> dict | str | None:
+    """Access a share link: check expiry, verify password, increment view_count, update last_accessed_at."""
+    rows = await db.execute_fetchall("SELECT * FROM share_links WHERE token = ?", (token,))
+    if not rows:
+        return None
+
+    link = rows[0]
+
+    # Check expiry
+    if link["expires_at"]:
+        try:
+            exp_dt = datetime.fromisoformat(link["expires_at"])
+            if datetime.now(timezone.utc) > exp_dt:
+                return "expired"
+        except (ValueError, TypeError):
+            pass
+
+    # Verify password if set
+    if link["password_hash"]:
+        if not password:
+            return "password_required"
+        if _hash_password(password) != link["password_hash"]:
+            return "invalid_password"
+
+    # Increment view_count and update last_accessed_at
+    now = _now()
+    await db.execute(
+        "UPDATE share_links SET view_count = view_count + 1, last_accessed_at = ? WHERE id = ?",
+        (now, link["id"]))
+    await db.commit()
+
+    # Return reel info along with link data
+    reel = await get_job(db, link["reel_id"])
+    link_data = await _get_share_link_by_id(db, link["id"])
+    return {
+        "link": link_data,
+        "reel": reel,
+    }
+
+
+async def record_download(db: aiosqlite.Connection, token: str, password: str | None = None) -> dict | str | None:
+    """Record a download: check expiry, verify password, check allow_download, increment download_count."""
+    rows = await db.execute_fetchall("SELECT * FROM share_links WHERE token = ?", (token,))
+    if not rows:
+        return None
+
+    link = rows[0]
+
+    # Check expiry
+    if link["expires_at"]:
+        try:
+            exp_dt = datetime.fromisoformat(link["expires_at"])
+            if datetime.now(timezone.utc) > exp_dt:
+                return "expired"
+        except (ValueError, TypeError):
+            pass
+
+    # Verify password if set
+    if link["password_hash"]:
+        if not password:
+            return "password_required"
+        if _hash_password(password) != link["password_hash"]:
+            return "invalid_password"
+
+    # Check if download is allowed
+    if not link["allow_download"]:
+        return "download_not_allowed"
+
+    # Increment download_count and update last_accessed_at
+    now = _now()
+    await db.execute(
+        """UPDATE share_links SET download_count = download_count + 1, last_accessed_at = ?
+           WHERE id = ?""",
+        (now, link["id"]))
+    await db.commit()
+
+    reel = await get_job(db, link["reel_id"])
+    return {
+        "download_url": reel["output_url"] if reel else None,
+        "reel_id": link["reel_id"],
+        "download_count": link["download_count"] + 1,
+    }
+
+
+async def revoke_share_link(db: aiosqlite.Connection, link_id: int) -> bool:
+    """Revoke (delete) a share link."""
+    cur = await db.execute("DELETE FROM share_links WHERE id = ?", (link_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_share_stats(db: aiosqlite.Connection) -> dict:
+    """Get aggregated share link statistics."""
+    total_row = await db.execute_fetchall("SELECT COUNT(*) as c FROM share_links")
+    total_links = total_row[0]["c"] if total_row else 0
+
+    views_row = await db.execute_fetchall("SELECT COALESCE(SUM(view_count), 0) as s FROM share_links")
+    total_views = views_row[0]["s"] if views_row else 0
+
+    downloads_row = await db.execute_fetchall("SELECT COALESCE(SUM(download_count), 0) as s FROM share_links")
+    total_downloads = downloads_row[0]["s"] if downloads_row else 0
+
+    # Most shared reels (by number of share links + total views)
+    most_shared_rows = await db.execute_fetchall("""
+        SELECT sl.reel_id, rj.title,
+               COUNT(sl.id) as link_count,
+               COALESCE(SUM(sl.view_count), 0) as total_views,
+               COALESCE(SUM(sl.download_count), 0) as total_downloads
+        FROM share_links sl
+        JOIN reel_jobs rj ON sl.reel_id = rj.id
+        GROUP BY sl.reel_id
+        ORDER BY total_views DESC
+        LIMIT 10
+    """)
+    most_shared_reels = [
+        {
+            "reel_id": r["reel_id"],
+            "title": r["title"],
+            "link_count": r["link_count"],
+            "total_views": r["total_views"],
+            "total_downloads": r["total_downloads"],
+        }
+        for r in most_shared_rows
+    ]
+
+    return {
+        "total_links": total_links,
+        "total_views": total_views,
+        "total_downloads": total_downloads,
+        "most_shared_reels": most_shared_reels,
+    }
