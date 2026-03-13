@@ -13,6 +13,9 @@ from models import (
     DailyAnalyticsEntry,
     ReelPresetInfo, EngagementEventCreate, EngagementSummary,
     EngagementTopReel, BrandAnalyticsEntry,
+    CollectionCreate, CollectionResponse, CollectionReelAdd, CollectionAnalytics,
+    ABTestCreate, ABTestResponse,
+    RenderQueueItem,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
@@ -22,6 +25,10 @@ from engine import (
     create_brand, list_brands, get_brand, update_brand, delete_brand,
     record_engagement, get_reel_engagement, get_engagement_analytics,
     get_brand_analytics, VALID_ENGAGEMENT_TYPES,
+    create_collection, list_collections, get_collection, delete_collection,
+    add_reel_to_collection, remove_reel_from_collection, get_collection_analytics,
+    create_ab_test, get_ab_test, list_ab_tests, complete_ab_test,
+    get_render_queue, VALID_PRIORITIES,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -36,8 +43,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="ReelForge",
-    description="Product photo to marketing reel generator. Submit photos, choose style, get a ready-to-post reel.",
-    version="0.6.0",
+    description=(
+        "Product photo to marketing reel generator. Submit photos, choose style, "
+        "get a ready-to-post reel. Supports brand profiles, collections, A/B testing, "
+        "engagement tracking, render queue with priorities, and analytics."
+    ),
+    version="0.7.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -45,7 +56,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 
 # ── Brands ───────────────────────────────────────────────────────────────
@@ -83,10 +94,113 @@ async def remove_brand(brand_id: int):
         raise HTTPException(404, "Brand not found")
 
 
+# ── Collections ──────────────────────────────────────────────────────────
+
+@app.post("/collections", response_model=CollectionResponse, status_code=201)
+async def add_collection(body: CollectionCreate):
+    """Create a collection to group reels for campaign tracking."""
+    return await create_collection(app.state.db, body.model_dump())
+
+
+@app.get("/collections", response_model=list[CollectionResponse])
+async def get_collections():
+    return await list_collections(app.state.db)
+
+
+@app.get("/collections/{collection_id}", response_model=CollectionResponse)
+async def get_collection_detail(collection_id: int):
+    c = await get_collection(app.state.db, collection_id)
+    if not c:
+        raise HTTPException(404, "Collection not found")
+    return c
+
+
+@app.delete("/collections/{collection_id}", status_code=204)
+async def remove_collection(collection_id: int):
+    ok = await delete_collection(app.state.db, collection_id)
+    if not ok:
+        raise HTTPException(404, "Collection not found")
+
+
+@app.post("/collections/{collection_id}/reels", response_model=CollectionResponse)
+async def collection_add_reel(collection_id: int, body: CollectionReelAdd):
+    """Add a reel to a collection."""
+    result = await add_reel_to_collection(app.state.db, collection_id, body.reel_id)
+    if result is None:
+        raise HTTPException(404, "Collection not found")
+    if result == "reel_not_found":
+        raise HTTPException(404, "Reel not found")
+    return result
+
+
+@app.delete("/collections/{collection_id}/reels/{reel_id}", response_model=CollectionResponse)
+async def collection_remove_reel(collection_id: int, reel_id: int):
+    """Remove a reel from a collection."""
+    result = await remove_reel_from_collection(app.state.db, collection_id, reel_id)
+    if not result:
+        raise HTTPException(404, "Collection not found")
+    return result
+
+
+@app.get("/collections/{collection_id}/analytics", response_model=CollectionAnalytics)
+async def collection_analytics(collection_id: int):
+    """Aggregated analytics for all reels in a collection."""
+    result = await get_collection_analytics(app.state.db, collection_id)
+    if not result:
+        raise HTTPException(404, "Collection not found")
+    return result
+
+
+# ── A/B Tests ────────────────────────────────────────────────────────────
+
+@app.post("/ab-tests", response_model=ABTestResponse, status_code=201)
+async def add_ab_test(body: ABTestCreate):
+    """Create an A/B test to compare engagement between multiple reels."""
+    result = await create_ab_test(app.state.db, body.model_dump())
+    if isinstance(result, str) and result.startswith("reel_not_found"):
+        rid = result.split(":")[1]
+        raise HTTPException(404, f"Reel {rid} not found")
+    return result
+
+
+@app.get("/ab-tests", response_model=list[ABTestResponse])
+async def get_ab_tests():
+    return await list_ab_tests(app.state.db)
+
+
+@app.get("/ab-tests/{test_id}", response_model=ABTestResponse)
+async def get_ab_test_detail(test_id: int):
+    result = await get_ab_test(app.state.db, test_id)
+    if not result:
+        raise HTTPException(404, "A/B test not found")
+    return result
+
+
+@app.post("/ab-tests/{test_id}/complete", response_model=ABTestResponse)
+async def finalize_ab_test(test_id: int):
+    """Mark an A/B test as completed and lock in the winner."""
+    result = await complete_ab_test(app.state.db, test_id)
+    if not result:
+        raise HTTPException(404, "A/B test not found")
+    return result
+
+
+# ── Render Queue ─────────────────────────────────────────────────────────
+
+@app.get("/queue", response_model=list[RenderQueueItem])
+async def render_queue():
+    """View the current render queue ordered by priority and creation time."""
+    return await get_render_queue(app.state.db)
+
+
 # ── Reels ────────────────────────────────────────────────────────────────
 
 @app.post("/reels", response_model=ReelJob, status_code=201)
 async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks):
+    if body.style not in STYLE_CATALOG:
+        raise HTTPException(422, f"Unknown style. Available: {', '.join(STYLE_CATALOG.keys())}")
+    if body.priority not in VALID_PRIORITIES:
+        raise HTTPException(422, f"Invalid priority. Must be one of: {', '.join(sorted(VALID_PRIORITIES))}")
     if body.brand_id:
         b = await get_brand(app.state.db, body.brand_id)
         if not b:
@@ -117,7 +231,6 @@ async def search_reels(
     q: str = Query(..., min_length=1, description="Search query (matches title)"),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """Search reel jobs by title."""
     return await search_jobs(app.state.db, q, limit)
 
 
@@ -129,7 +242,6 @@ async def list_reels(
     return await list_jobs(app.state.db, status, limit)
 
 
-# render-log, retry, duplicate BEFORE /{job_id} to ensure correct routing
 @app.get("/reels/{job_id}/render-log", response_model=RenderLogResponse)
 async def render_log(job_id: int):
     log = await get_render_log(app.state.db, job_id)
@@ -165,7 +277,6 @@ async def duplicate_reel(
     return result
 
 
-# engagement BEFORE /{job_id} catch-all
 @app.post("/reels/{job_id}/engagement", response_model=EngagementSummary)
 async def log_engagement(job_id: int, body: EngagementEventCreate):
     """Record an engagement event (view, like, share, click, save) for a reel."""
@@ -179,7 +290,6 @@ async def log_engagement(job_id: int, body: EngagementEventCreate):
 
 @app.get("/reels/{job_id}/engagement", response_model=EngagementSummary)
 async def reel_engagement(job_id: int):
-    """Get engagement summary for a reel: views, likes, shares, clicks, saves, engagement rate."""
     result = await get_reel_engagement(app.state.db, job_id)
     if not result:
         raise HTTPException(404, "Reel job not found")
@@ -214,7 +324,6 @@ async def list_styles():
 
 @app.get("/presets", response_model=list[ReelPresetInfo])
 async def list_presets():
-    """List all reel presets with recommended settings and scene flow."""
     return [
         ReelPresetInfo(name=k, **v)
         for k, v in REEL_PRESETS.items()
@@ -223,7 +332,6 @@ async def list_presets():
 
 @app.get("/presets/{preset_name}", response_model=ReelPresetInfo)
 async def get_preset(preset_name: str):
-    """Get a specific reel preset by name."""
     if preset_name not in REEL_PRESETS:
         raise HTTPException(404, f"Preset not found. Available: {', '.join(REEL_PRESETS.keys())}")
     return ReelPresetInfo(name=preset_name, **REEL_PRESETS[preset_name])
@@ -235,7 +343,6 @@ async def get_preset(preset_name: str):
 async def daily_analytics(
     days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
 ):
-    """Daily breakdown: reels created, completed, failed, top style per day."""
     return await get_daily_analytics(app.state.db, days)
 
 
@@ -244,19 +351,16 @@ async def engagement_analytics(
     limit: int = Query(20, ge=1, le=100),
     sort_by: str = Query("engagement_rate", description="Sort by: engagement_rate | views | likes | shares | clicks | saves"),
 ):
-    """Top performing reels ranked by engagement metrics."""
     return await get_engagement_analytics(app.state.db, limit, sort_by)
 
 
 @app.get("/analytics/brands", response_model=list[BrandAnalyticsEntry])
 async def brand_analytics():
-    """Per-brand performance: reels, completion rate, avg render time, engagement."""
     return await get_brand_analytics(app.state.db)
 
 
 @app.get("/stats/by-style")
 async def stats_by_style():
-    """Per-style breakdown: total jobs, completed, failed, avg duration, success rate."""
     return await get_stats_by_style(app.state.db)
 
 
