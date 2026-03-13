@@ -19,6 +19,10 @@ from models import (
     TagRequest, TagStats, TagAnalytics,
     WebhookCreate, WebhookResponse, WebhookUpdate, VALID_WEBHOOK_EVENTS,
     ScheduleCreate, ScheduleResponse,
+    TemplateCreate, TemplateUpdate, TemplateResponse, CreateFromTemplateRequest,
+    VALID_TEMPLATE_CATEGORIES,
+    CommentCreate, CommentUpdate, CommentResponse, CommentStats,
+    ShareLinkCreate, ShareLinkResponse, ShareLinkAccess, ShareLinkStats,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
@@ -35,6 +39,12 @@ from engine import (
     add_tag, remove_tag, list_all_tags, get_tag_analytics,
     create_webhook, list_webhooks, get_webhook, update_webhook, delete_webhook,
     schedule_publish, list_scheduled, cancel_schedule,
+    create_template, list_templates, get_template, update_template, delete_template,
+    create_reel_from_template,
+    add_comment, list_comments, get_comment, update_comment, delete_comment,
+    resolve_comment, get_comment_stats,
+    create_share_link, list_share_links, get_share_link_by_token,
+    access_share_link, record_download, revoke_share_link, get_share_stats,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -53,9 +63,9 @@ app = FastAPI(
         "Product photo to marketing reel generator. Submit photos, choose style, "
         "get a ready-to-post reel. Supports brand profiles, collections, A/B testing, "
         "engagement tracking, render queue with priorities, reel tags, webhooks, "
-        "scheduled publishing, and analytics."
+        "scheduled publishing, reel templates, team comments, share links, and analytics."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -63,10 +73,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.8.0"}
+    return {"status": "ok", "version": "0.9.0"}
 
 
-# ── Brands ───────────────────────────────────────────────────────────────
+# -- Brands ------------------------------------------------------------------
 
 @app.post("/brands", response_model=BrandResponse, status_code=201)
 async def add_brand(body: BrandCreate):
@@ -101,7 +111,7 @@ async def remove_brand(brand_id: int):
         raise HTTPException(404, "Brand not found")
 
 
-# ── Collections ──────────────────────────────────────────────────────────
+# -- Collections -------------------------------------------------------------
 
 @app.post("/collections", response_model=CollectionResponse, status_code=201)
 async def add_collection(body: CollectionCreate):
@@ -154,7 +164,7 @@ async def collection_analytics(collection_id: int):
     return result
 
 
-# ── A/B Tests ────────────────────────────────────────────────────────────
+# -- A/B Tests ---------------------------------------------------------------
 
 @app.post("/ab-tests", response_model=ABTestResponse, status_code=201)
 async def add_ab_test(body: ABTestCreate):
@@ -186,14 +196,14 @@ async def finalize_ab_test(test_id: int):
     return result
 
 
-# ── Render Queue ─────────────────────────────────────────────────────────
+# -- Render Queue ------------------------------------------------------------
 
 @app.get("/queue", response_model=list[RenderQueueItem])
 async def render_queue():
     return await get_render_queue(app.state.db)
 
 
-# ── Tags ─────────────────────────────────────────────────────────────────
+# -- Tags --------------------------------------------------------------------
 
 @app.post("/reels/{reel_id}/tags", status_code=201)
 async def tag_reel(reel_id: int, body: TagRequest):
@@ -230,7 +240,7 @@ async def tag_analytics(tag: str):
     return result
 
 
-# ── Webhooks ─────────────────────────────────────────────────────────────
+# -- Webhooks ----------------------------------------------------------------
 
 @app.post("/webhooks", response_model=WebhookResponse, status_code=201)
 async def add_webhook(body: WebhookCreate):
@@ -274,7 +284,7 @@ async def remove_webhook(wh_id: int):
         raise HTTPException(404, "Webhook not found")
 
 
-# ── Scheduled Publishing ────────────────────────────────────────────────
+# -- Scheduled Publishing ---------------------------------------------------
 
 @app.post("/reels/{reel_id}/schedule", response_model=ScheduleResponse, status_code=201)
 async def schedule_reel(reel_id: int, body: ScheduleCreate):
@@ -310,7 +320,212 @@ async def unschedule_reel(
         raise HTTPException(404, "No active schedule found for this reel")
 
 
-# ── Reels ────────────────────────────────────────────────────────────────
+# -- Reel Templates (v0.9.0) ------------------------------------------------
+
+@app.post("/templates", response_model=TemplateResponse, status_code=201)
+async def add_template(body: TemplateCreate):
+    """Create a reusable reel template. Optionally copy settings from an existing reel."""
+    if body.category and body.category not in VALID_TEMPLATE_CATEGORIES:
+        raise HTTPException(
+            422,
+            f"Invalid category. Must be one of: {', '.join(sorted(VALID_TEMPLATE_CATEGORIES))}",
+        )
+    if body.style and body.style not in STYLE_CATALOG:
+        raise HTTPException(422, f"Unknown style. Available: {', '.join(STYLE_CATALOG.keys())}")
+    result = await create_template(app.state.db, body.model_dump())
+    if result == "reel_not_found":
+        raise HTTPException(404, "Source reel not found")
+    if result == "invalid_category":
+        raise HTTPException(422, f"Invalid category. Must be one of: {', '.join(sorted(VALID_TEMPLATE_CATEGORIES))}")
+    if result == "invalid_style":
+        raise HTTPException(422, f"Unknown style. Available: {', '.join(STYLE_CATALOG.keys())}")
+    if result == "brand_not_found":
+        raise HTTPException(404, "Brand not found")
+    return result
+
+
+@app.get("/templates", response_model=list[TemplateResponse])
+async def get_templates(
+    category: str | None = Query(None, description="Filter by category"),
+    brand_id: int | None = Query(None, description="Filter by brand ID"),
+):
+    """List all templates, optionally filtered by category or brand."""
+    if category and category not in VALID_TEMPLATE_CATEGORIES:
+        raise HTTPException(
+            422,
+            f"Invalid category. Must be one of: {', '.join(sorted(VALID_TEMPLATE_CATEGORIES))}",
+        )
+    return await list_templates(app.state.db, category, brand_id)
+
+
+@app.get("/templates/{template_id}", response_model=TemplateResponse)
+async def get_template_detail(template_id: int):
+    t = await get_template(app.state.db, template_id)
+    if not t:
+        raise HTTPException(404, "Template not found")
+    return t
+
+
+@app.patch("/templates/{template_id}", response_model=TemplateResponse)
+async def patch_template(template_id: int, body: TemplateUpdate):
+    """Update template name, description, or category."""
+    result = await update_template(app.state.db, template_id, body.model_dump(exclude_unset=True))
+    if result is None:
+        raise HTTPException(404, "Template not found")
+    if result == "invalid_category":
+        raise HTTPException(
+            422,
+            f"Invalid category. Must be one of: {', '.join(sorted(VALID_TEMPLATE_CATEGORIES))}",
+        )
+    return result
+
+
+@app.delete("/templates/{template_id}", status_code=204)
+async def remove_template(template_id: int):
+    ok = await delete_template(app.state.db, template_id)
+    if not ok:
+        raise HTTPException(404, "Template not found")
+
+
+@app.post("/templates/{template_id}/create-reel", response_model=ReelJob, status_code=201)
+async def reel_from_template(
+    template_id: int,
+    body: CreateFromTemplateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Create a new reel job using a template's settings."""
+    result = await create_reel_from_template(app.state.db, template_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Template not found")
+    if result == "invalid_priority":
+        raise HTTPException(422, f"Invalid priority. Must be one of: {', '.join(sorted(VALID_PRIORITIES))}")
+    background_tasks.add_task(process_job, app.state.db, result["id"])
+    return result
+
+
+# -- Reel Comments / Collaboration (v0.9.0) ---------------------------------
+
+@app.post("/reels/{reel_id}/comments", response_model=CommentResponse, status_code=201)
+async def create_comment(reel_id: int, body: CommentCreate):
+    """Add a comment to a reel. Supports threaded replies via parent_id."""
+    result = await add_comment(app.state.db, reel_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "parent_not_found":
+        raise HTTPException(404, "Parent comment not found")
+    if result == "parent_wrong_reel":
+        raise HTTPException(422, "Parent comment belongs to a different reel")
+    if result == "nested_reply_not_allowed":
+        raise HTTPException(422, "Nested replies are not allowed. Reply to the top-level comment instead")
+    return result
+
+
+@app.get("/reels/{reel_id}/comments", response_model=list[CommentResponse])
+async def get_reel_comments(
+    reel_id: int,
+    author: str | None = Query(None, description="Filter by author"),
+    resolved: bool | None = Query(None, description="Filter by resolved status"),
+):
+    """List top-level comments on a reel with reply counts."""
+    result = await list_comments(app.state.db, reel_id, author, resolved)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    return result
+
+
+@app.patch("/comments/{comment_id}", response_model=CommentResponse)
+async def edit_comment(comment_id: int, body: CommentUpdate):
+    """Update a comment's content or resolved status."""
+    result = await update_comment(app.state.db, comment_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Comment not found")
+    return result
+
+
+@app.delete("/comments/{comment_id}", status_code=204)
+async def remove_comment(comment_id: int):
+    """Delete a comment and all its replies."""
+    ok = await delete_comment(app.state.db, comment_id)
+    if not ok:
+        raise HTTPException(404, "Comment not found")
+
+
+@app.post("/comments/{comment_id}/resolve", response_model=CommentResponse)
+async def mark_comment_resolved(comment_id: int):
+    """Mark a comment as resolved."""
+    result = await resolve_comment(app.state.db, comment_id)
+    if not result:
+        raise HTTPException(404, "Comment not found")
+    return result
+
+
+# -- Export & Share Links (v0.9.0) -------------------------------------------
+
+@app.post("/reels/{reel_id}/share", response_model=ShareLinkResponse, status_code=201)
+async def create_share(reel_id: int, body: ShareLinkCreate):
+    """Generate a shareable link for a completed reel."""
+    result = await create_share_link(app.state.db, reel_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "not_completed":
+        raise HTTPException(422, "Only completed reels can be shared")
+    return result
+
+
+@app.get("/reels/{reel_id}/share-links", response_model=list[ShareLinkResponse])
+async def get_reel_share_links(reel_id: int):
+    """List all share links for a reel."""
+    result = await list_share_links(app.state.db, reel_id)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    return result
+
+
+@app.get("/share/{token}")
+async def access_shared_reel(
+    token: str,
+    password: str | None = Query(None, description="Password if link is protected"),
+):
+    """Public endpoint to access a shared reel via token."""
+    result = await access_share_link(app.state.db, token, password)
+    if result is None:
+        raise HTTPException(404, "Share link not found")
+    if result == "expired":
+        raise HTTPException(410, "Share link has expired")
+    if result == "password_required":
+        raise HTTPException(401, "This link is password-protected. Provide password query parameter")
+    if result == "invalid_password":
+        raise HTTPException(403, "Invalid password")
+    return result
+
+
+@app.post("/share/{token}/download")
+async def download_shared_reel(token: str, body: ShareLinkAccess | None = None):
+    """Record a download of a shared reel. Provide password in body if link is protected."""
+    pwd = body.password if body else None
+    result = await record_download(app.state.db, token, pwd)
+    if result is None:
+        raise HTTPException(404, "Share link not found")
+    if result == "expired":
+        raise HTTPException(410, "Share link has expired")
+    if result == "password_required":
+        raise HTTPException(401, "This link is password-protected. Provide password in request body")
+    if result == "invalid_password":
+        raise HTTPException(403, "Invalid password")
+    if result == "download_not_allowed":
+        raise HTTPException(403, "Downloads are not allowed for this share link")
+    return result
+
+
+@app.delete("/share-links/{link_id}", status_code=204)
+async def remove_share_link(link_id: int):
+    """Revoke a share link."""
+    ok = await revoke_share_link(app.state.db, link_id)
+    if not ok:
+        raise HTTPException(404, "Share link not found")
+
+
+# -- Reels -------------------------------------------------------------------
 
 @app.post("/reels", response_model=ReelJob, status_code=201)
 async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks):
@@ -435,7 +650,7 @@ async def list_styles():
     ]
 
 
-# ── Presets ──────────────────────────────────────────────────────────────
+# -- Presets -----------------------------------------------------------------
 
 @app.get("/presets", response_model=list[ReelPresetInfo])
 async def list_presets():
@@ -452,7 +667,7 @@ async def get_preset(preset_name: str):
     return ReelPresetInfo(name=preset_name, **REEL_PRESETS[preset_name])
 
 
-# ── Analytics ────────────────────────────────────────────────────────────
+# -- Analytics ---------------------------------------------------------------
 
 @app.get("/analytics/daily", response_model=list[DailyAnalyticsEntry])
 async def daily_analytics(
@@ -472,6 +687,18 @@ async def engagement_analytics(
 @app.get("/analytics/brands", response_model=list[BrandAnalyticsEntry])
 async def brand_analytics():
     return await get_brand_analytics(app.state.db)
+
+
+@app.get("/analytics/comments", response_model=CommentStats)
+async def comments_analytics():
+    """Get global comment statistics: total, resolved, unresolved, top commenters."""
+    return await get_comment_stats(app.state.db)
+
+
+@app.get("/analytics/shares", response_model=ShareLinkStats)
+async def shares_analytics():
+    """Get aggregated share link statistics: total links, views, downloads, most shared reels."""
+    return await get_share_stats(app.state.db)
 
 
 @app.get("/stats/by-style")
