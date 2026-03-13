@@ -11,13 +11,17 @@ from models import (
     StyleInfo, StatsResponse, RenderLogResponse,
     BrandCreate, BrandUpdate, BrandResponse,
     DailyAnalyticsEntry,
+    ReelPresetInfo, EngagementEventCreate, EngagementSummary,
+    EngagementTopReel, BrandAnalyticsEntry,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
     get_job, get_render_log, process_job,
-    delete_job, get_stats, STYLE_CATALOG,
+    delete_job, get_stats, STYLE_CATALOG, REEL_PRESETS,
     duplicate_job, get_stats_by_style, get_daily_analytics,
     create_brand, list_brands, get_brand, update_brand, delete_brand,
+    record_engagement, get_reel_engagement, get_engagement_analytics,
+    get_brand_analytics, VALID_ENGAGEMENT_TYPES,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -33,7 +37,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ReelForge",
     description="Product photo to marketing reel generator. Submit photos, choose style, get a ready-to-post reel.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -41,7 +45,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 # ── Brands ───────────────────────────────────────────────────────────────
@@ -161,6 +165,27 @@ async def duplicate_reel(
     return result
 
 
+# engagement BEFORE /{job_id} catch-all
+@app.post("/reels/{job_id}/engagement", response_model=EngagementSummary)
+async def log_engagement(job_id: int, body: EngagementEventCreate):
+    """Record an engagement event (view, like, share, click, save) for a reel."""
+    if body.event_type not in VALID_ENGAGEMENT_TYPES:
+        raise HTTPException(422, f"Invalid event_type. Must be one of: {', '.join(sorted(VALID_ENGAGEMENT_TYPES))}")
+    result = await record_engagement(app.state.db, job_id, body.event_type, body.source)
+    if not result:
+        raise HTTPException(404, "Reel job not found")
+    return result
+
+
+@app.get("/reels/{job_id}/engagement", response_model=EngagementSummary)
+async def reel_engagement(job_id: int):
+    """Get engagement summary for a reel: views, likes, shares, clicks, saves, engagement rate."""
+    result = await get_reel_engagement(app.state.db, job_id)
+    if not result:
+        raise HTTPException(404, "Reel job not found")
+    return result
+
+
 @app.get("/reels/{job_id}", response_model=ReelJob)
 async def get_reel(job_id: int):
     job = await get_job(app.state.db, job_id)
@@ -185,6 +210,25 @@ async def list_styles():
     ]
 
 
+# ── Presets ──────────────────────────────────────────────────────────────
+
+@app.get("/presets", response_model=list[ReelPresetInfo])
+async def list_presets():
+    """List all reel presets with recommended settings and scene flow."""
+    return [
+        ReelPresetInfo(name=k, **v)
+        for k, v in REEL_PRESETS.items()
+    ]
+
+
+@app.get("/presets/{preset_name}", response_model=ReelPresetInfo)
+async def get_preset(preset_name: str):
+    """Get a specific reel preset by name."""
+    if preset_name not in REEL_PRESETS:
+        raise HTTPException(404, f"Preset not found. Available: {', '.join(REEL_PRESETS.keys())}")
+    return ReelPresetInfo(name=preset_name, **REEL_PRESETS[preset_name])
+
+
 # ── Analytics ────────────────────────────────────────────────────────────
 
 @app.get("/analytics/daily", response_model=list[DailyAnalyticsEntry])
@@ -193,6 +237,21 @@ async def daily_analytics(
 ):
     """Daily breakdown: reels created, completed, failed, top style per day."""
     return await get_daily_analytics(app.state.db, days)
+
+
+@app.get("/analytics/engagement", response_model=list[EngagementTopReel])
+async def engagement_analytics(
+    limit: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("engagement_rate", description="Sort by: engagement_rate | views | likes | shares | clicks | saves"),
+):
+    """Top performing reels ranked by engagement metrics."""
+    return await get_engagement_analytics(app.state.db, limit, sort_by)
+
+
+@app.get("/analytics/brands", response_model=list[BrandAnalyticsEntry])
+async def brand_analytics():
+    """Per-brand performance: reels, completion rate, avg render time, engagement."""
+    return await get_brand_analytics(app.state.db)
 
 
 @app.get("/stats/by-style")
