@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 
@@ -162,7 +162,6 @@ async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
     brand = await get_brand(db, brand_id)
     if not brand:
         return data
-    # Only fill if user didn't provide explicit value
     if not data.get("brand_color") and brand["brand_color"]:
         data["brand_color"] = brand["brand_color"]
     if not data.get("cta_text") and brand["default_cta"]:
@@ -192,6 +191,18 @@ async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
     return _job_row(rows[0])
 
 
+async def batch_create_jobs(db: aiosqlite.Connection, data: dict) -> list[dict]:
+    """Create multiple reel jobs from the same photo set with different styles."""
+    styles = data["styles"]
+    base = {k: v for k, v in data.items() if k != "styles"}
+    jobs = []
+    for style in styles:
+        job_data = {**base, "style": style}
+        job = await create_job(db, job_data)
+        jobs.append(job)
+    return jobs
+
+
 async def list_jobs(db: aiosqlite.Connection, status: str | None = None, limit: int = 50) -> list[dict]:
     q = "SELECT * FROM reel_jobs"
     params = []
@@ -201,6 +212,20 @@ async def list_jobs(db: aiosqlite.Connection, status: str | None = None, limit: 
     q += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(q, params)
+    return [{
+        "id": r["id"], "title": r["title"], "style": r["style"],
+        "aspect_ratio": r["aspect_ratio"], "status": r["status"],
+        "photo_count": len(json.loads(r["photo_urls"])),
+        "created_at": r["created_at"],
+    } for r in rows]
+
+
+async def search_jobs(db: aiosqlite.Connection, query: str, limit: int = 50) -> list[dict]:
+    """Search reel jobs by title (case-insensitive LIKE)."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM reel_jobs WHERE title LIKE ? ORDER BY created_at DESC LIMIT ?",
+        (f"%{query}%", limit),
+    )
     return [{
         "id": r["id"], "title": r["title"], "style": r["style"],
         "aspect_ratio": r["aspect_ratio"], "status": r["status"],
@@ -351,3 +376,29 @@ async def get_stats_by_style(db: aiosqlite.Connection) -> list[dict]:
         b["success_rate_pct"] = round(b["completed"] / b["total"] * 100, 1) if b["total"] else 0.0
         result.append(b)
     return sorted(result, key=lambda x: x["total"], reverse=True)
+
+
+async def get_daily_analytics(db: aiosqlite.Connection, days: int = 30) -> list[dict]:
+    """Daily breakdown of reel jobs: created, completed, failed for the last N days."""
+    since = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
+    rows = await db.execute_fetchall(
+        "SELECT * FROM reel_jobs WHERE date(created_at) >= ?", (since,)
+    )
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        day = r["created_at"][:10]
+        if day not in buckets:
+            buckets[day] = {"date": day, "created": 0, "completed": 0, "failed": 0, "styles": {}}
+        buckets[day]["created"] += 1
+        if r["status"] == "completed":
+            buckets[day]["completed"] += 1
+        elif r["status"] == "failed":
+            buckets[day]["failed"] += 1
+        s = r["style"]
+        buckets[day]["styles"][s] = buckets[day]["styles"].get(s, 0) + 1
+    result = []
+    for b in sorted(buckets.values(), key=lambda x: x["date"]):
+        styles = b.pop("styles")
+        b["top_style"] = max(styles, key=styles.get) if styles else None
+        result.append(b)
+    return result
