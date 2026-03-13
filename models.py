@@ -141,7 +141,7 @@ class DailyAnalyticsEntry(BaseModel):
     top_style: Optional[str]
 
 
-# ── Reel Presets ────────────────────────────────────────────────────────────
+# -- Reel Presets ------------------------------------------------------------
 
 class ReelPresetInfo(BaseModel):
     name: str
@@ -154,7 +154,7 @@ class ReelPresetInfo(BaseModel):
     scene_flow: list[str]
 
 
-# ── Engagement ──────────────────────────────────────────────────────────────
+# -- Engagement --------------------------------------------------------------
 
 class EngagementEventCreate(BaseModel):
     event_type: str = Field(..., description="view | like | share | click | save")
@@ -186,7 +186,7 @@ class EngagementTopReel(BaseModel):
     engagement_rate: float
 
 
-# ── Brand Analytics ─────────────────────────────────────────────────────────
+# -- Brand Analytics ---------------------------------------------------------
 
 class BrandAnalyticsEntry(BaseModel):
     brand_id: int
@@ -201,7 +201,7 @@ class BrandAnalyticsEntry(BaseModel):
     engagement_rate: float
 
 
-# ── Collections ─────────────────────────────────────────────────────────────
+# -- Collections -------------------------------------------------------------
 
 class CollectionCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
@@ -235,7 +235,7 @@ class CollectionAnalytics(BaseModel):
     top_style: Optional[str]
 
 
-# ── A/B Test ────────────────────────────────────────────────────────────────
+# -- A/B Test ----------------------------------------------------------------
 
 class ABTestCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
@@ -264,7 +264,7 @@ class ABTestResponse(BaseModel):
     created_at: str
 
 
-# ── Render Queue ────────────────────────────────────────────────────────────
+# -- Render Queue ------------------------------------------------------------
 
 class RenderQueueItem(BaseModel):
     id: int
@@ -276,7 +276,7 @@ class RenderQueueItem(BaseModel):
     position: int
 
 
-# ── Tags ────────────────────────────────────────────────────────────────────
+# -- Tags --------------------------------------------------------------------
 
 class TagRequest(BaseModel):
     tag: str = Field(..., min_length=1, max_length=50)
@@ -296,7 +296,7 @@ class TagAnalytics(BaseModel):
     top_style: Optional[str]
 
 
-# ── Webhooks ────────────────────────────────────────────────────────────────
+# -- Webhooks ----------------------------------------------------------------
 
 VALID_WEBHOOK_EVENTS = {"render_complete", "render_failed", "all"}
 
@@ -323,7 +323,7 @@ class WebhookUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-# ── Scheduled Publishing ───────────────────────────────────────────────────
+# -- Scheduled Publishing ---------------------------------------------------
 
 class ScheduleCreate(BaseModel):
     publish_at: str = Field(..., description="ISO datetime for scheduled publishing (YYYY-MM-DDTHH:MM:SS)")
@@ -340,3 +340,126 @@ class ScheduleResponse(BaseModel):
     caption: Optional[str]
     status: str  # scheduled | published | cancelled
     created_at: str
+
+
+# -- Reel Templates (v0.9.0) ------------------------------------------------
+
+VALID_TEMPLATE_CATEGORIES = {
+    "product", "lifestyle", "tutorial", "testimonial",
+    "announcement", "seasonal", "promotion", "general",
+}
+
+
+class TemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120, description="Template name")
+    description: Optional[str] = Field(None, max_length=500)
+    source_reel_id: Optional[int] = Field(None, description="Copy settings from an existing reel")
+    category: Optional[str] = Field("general", description="Template category")
+    style: Optional[str] = Field(None, description="dynamic | minimal | luxury | playful | cinematic")
+    aspect_ratio: Optional[str] = Field(None, description="9:16 | 1:1 | 16:9")
+    music_genre: Optional[str] = None
+    brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
+    cta_text: Optional[str] = None
+    duration_target: Optional[int] = Field(None, ge=5, le=60)
+    brand_id: Optional[int] = None
+
+
+class TemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = Field(None, max_length=500)
+    category: Optional[str] = None
+
+
+class TemplateResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    source_reel_id: Optional[int]
+    style: str
+    aspect_ratio: str
+    music_genre: Optional[str]
+    brand_color: Optional[str]
+    cta_text: Optional[str]
+    duration_target: int
+    brand_id: Optional[int]
+    category: str
+    times_used: int
+    created_at: str
+
+
+class CreateFromTemplateRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200, description="Reel title")
+    photo_urls: list[str] = Field(..., min_length=1, max_length=10)
+    caption: Optional[str] = None
+    priority: Optional[str] = Field("normal", description="low | normal | high | urgent")
+    tags: list[str] = Field(default_factory=list, description="Tags for the new reel")
+
+
+# -- Reel Comments / Collaboration (v0.9.0) ---------------------------------
+
+class CommentCreate(BaseModel):
+    author: str = Field(..., min_length=1, max_length=100, description="Comment author name")
+    content: str = Field(..., min_length=1, max_length=2000, description="Comment text")
+    parent_id: Optional[int] = Field(None, description="Parent comment ID for threaded replies")
+
+
+class CommentUpdate(BaseModel):
+    content: Optional[str] = Field(None, min_length=1, max_length=2000)
+    is_resolved: Optional[bool] = None
+
+
+class CommentResponse(BaseModel):
+    id: int
+    reel_id: int
+    author: str
+    content: str
+    is_resolved: bool
+    parent_id: Optional[int]
+    replies_count: int
+    created_at: str
+    updated_at: Optional[str]
+
+
+class CommentThread(BaseModel):
+    comment: CommentResponse
+    replies: list[CommentResponse]
+
+
+class CommentStats(BaseModel):
+    total_comments: int
+    resolved: int
+    unresolved: int
+    top_commenters: list[dict]
+
+
+# -- Export & Share Links (v0.9.0) -------------------------------------------
+
+class ShareLinkCreate(BaseModel):
+    expires_in_hours: Optional[int] = Field(72, ge=1, le=8760, description="Hours until link expires (default 72)")
+    password: Optional[str] = Field(None, min_length=4, max_length=100, description="Optional password protection")
+    allow_download: Optional[bool] = Field(True, description="Allow downloading the reel")
+
+
+class ShareLinkResponse(BaseModel):
+    id: int
+    reel_id: int
+    token: str
+    expires_at: Optional[str]
+    allow_download: bool
+    view_count: int
+    download_count: int
+    is_expired: bool
+    share_url: str
+    created_at: str
+    last_accessed_at: Optional[str]
+
+
+class ShareLinkAccess(BaseModel):
+    password: Optional[str] = Field(None, description="Password if link is protected")
+
+
+class ShareLinkStats(BaseModel):
+    total_links: int
+    total_views: int
+    total_downloads: int
+    most_shared_reels: list[dict]
