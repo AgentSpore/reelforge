@@ -10,6 +10,7 @@ class ReelJob(BaseModel):
     style: str
     aspect_ratio: str
     status: str
+    priority: str = "normal"
     brand_id: Optional[int] = None
     output_url: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -29,6 +30,7 @@ class CreateReelRequest(BaseModel):
     brand_color: Optional[str] = Field(None, description="Hex colour, e.g. #FF6B35")
     cta_text: Optional[str] = None
     duration_target: int = Field(15, ge=5, le=60)
+    priority: str = Field("normal", description="low | normal | high | urgent")
 
 
 class BatchCreateRequest(BaseModel):
@@ -42,6 +44,7 @@ class BatchCreateRequest(BaseModel):
     brand_color: Optional[str] = None
     cta_text: Optional[str] = None
     duration_target: int = Field(15, ge=5, le=60)
+    priority: str = Field("normal", description="low | normal | high | urgent")
 
 
 class DuplicateReelRequest(BaseModel):
@@ -61,6 +64,7 @@ class ReelListItem(BaseModel):
     style: str
     aspect_ratio: str
     status: str
+    priority: str
     photo_count: int
     created_at: str
 
@@ -111,6 +115,7 @@ class StatsResponse(BaseModel):
     most_used_style: Optional[str]
     most_used_ratio: Optional[str]
     total_brands: int
+    total_collections: int
 
 
 class RenderLogResponse(BaseModel):
@@ -188,3 +193,78 @@ class BrandAnalyticsEntry(BaseModel):
     top_style: Optional[str]
     total_views: int
     engagement_rate: float
+
+
+# ── Collections ─────────────────────────────────────────────────────────────
+
+class CollectionCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class CollectionResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    reel_count: int
+    created_at: str
+
+
+class CollectionReelAdd(BaseModel):
+    reel_id: int
+
+
+class CollectionAnalytics(BaseModel):
+    collection_id: int
+    collection_name: str
+    total_reels: int
+    completed: int
+    failed: int
+    processing: int
+    completion_rate: float
+    total_views: int
+    total_likes: int
+    total_shares: int
+    engagement_rate: float
+    top_style: Optional[str]
+
+
+# ── A/B Test ────────────────────────────────────────────────────────────────
+
+class ABTestCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    reel_ids: list[int] = Field(..., min_length=2, max_length=5, description="Reel IDs to compare")
+
+
+class ABTestReelResult(BaseModel):
+    reel_id: int
+    title: str
+    style: str
+    views: int
+    likes: int
+    shares: int
+    clicks: int
+    saves: int
+    engagement_rate: float
+    is_winner: bool
+
+
+class ABTestResponse(BaseModel):
+    id: int
+    name: str
+    status: str  # active | completed
+    reels: list[ABTestReelResult]
+    winner_id: Optional[int]
+    created_at: str
+
+
+# ── Render Queue ────────────────────────────────────────────────────────────
+
+class RenderQueueItem(BaseModel):
+    id: int
+    title: str
+    style: str
+    priority: str
+    status: str
+    created_at: str
+    position: int
