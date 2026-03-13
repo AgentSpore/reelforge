@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import secrets
 from datetime import datetime, timezone, timedelta
+import calendar as cal_mod
 
 import aiosqlite
 
@@ -115,6 +116,13 @@ VALID_TEMPLATE_CATEGORIES = {
     "announcement", "seasonal", "promotion", "general",
 }
 
+VALID_RESOLUTIONS = {"720p", "1080p", "1440p", "4k"}
+VALID_FPS = {24, 30, 60}
+VALID_CODECS = {"h264", "h265", "vp9", "av1"}
+VALID_QUALITY_PRESETS = {"draft", "balanced", "high", "ultra"}
+
+VALID_CALENDAR_STATUSES = {"planned", "assigned", "published", "skipped"}
+
 SHARE_BASE_URL = "https://reelforge.io/share"
 
 
@@ -143,6 +151,10 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _migrate_templates(db)
     await _migrate_comments(db)
     await _migrate_share_links(db)
+    await _migrate_render_profiles(db)
+    await _migrate_reel_versions(db)
+    await _migrate_calendar_slots(db)
+    await _migrate_render_profile_id(db)
     await db.commit()
     return db
 
@@ -316,6 +328,71 @@ async def _migrate_share_links(db: aiosqlite.Connection):
     """)
 
 
+# -- v1.0.0 Migrations -------------------------------------------------------
+
+async def _migrate_render_profiles(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS render_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            resolution TEXT NOT NULL DEFAULT '1080p',
+            fps INTEGER NOT NULL DEFAULT 30,
+            codec TEXT NOT NULL DEFAULT 'h264',
+            bitrate_kbps INTEGER NOT NULL DEFAULT 5000,
+            quality_preset TEXT NOT NULL DEFAULT 'balanced',
+            description TEXT,
+            created_at TEXT NOT NULL
+        );
+    """)
+
+
+async def _migrate_render_profile_id(db: aiosqlite.Connection):
+    try:
+        await db.execute("SELECT render_profile_id FROM reel_jobs LIMIT 1")
+    except Exception:
+        try:
+            await db.execute("ALTER TABLE reel_jobs ADD COLUMN render_profile_id INTEGER")
+        except Exception:
+            pass
+
+
+async def _migrate_reel_versions(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS reel_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reel_id INTEGER NOT NULL REFERENCES reel_jobs(id) ON DELETE CASCADE,
+            version_number INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            style TEXT NOT NULL,
+            photo_urls TEXT NOT NULL,
+            render_settings TEXT NOT NULL DEFAULT '{}',
+            output_url TEXT,
+            created_at TEXT NOT NULL,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_versions_reel ON reel_versions(reel_id);
+    """)
+
+
+async def _migrate_calendar_slots(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS calendar_slots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            planned_date TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            reel_id INTEGER,
+            notes TEXT,
+            status TEXT NOT NULL DEFAULT 'planned',
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_calendar_date ON calendar_slots(planned_date);
+        CREATE INDEX IF NOT EXISTS idx_calendar_platform ON calendar_slots(platform);
+        CREATE INDEX IF NOT EXISTS idx_calendar_status ON calendar_slots(status);
+    """)
+
+
 # -- Row helpers -------------------------------------------------------------
 
 def _job_row(r: aiosqlite.Row, tags: list[str] | None = None) -> dict:
@@ -330,12 +407,18 @@ def _job_row(r: aiosqlite.Row, tags: list[str] | None = None) -> dict:
         priority = r["priority"]
     except (IndexError, KeyError):
         pass
+    render_profile_id = None
+    try:
+        render_profile_id = r["render_profile_id"]
+    except (IndexError, KeyError):
+        pass
     return {
         "id": r["id"], "title": r["title"],
         "photo_urls": json.loads(r["photo_urls"]),
         "style": r["style"], "aspect_ratio": r["aspect_ratio"],
         "status": r["status"], "priority": priority or "normal",
         "brand_id": r["brand_id"],
+        "render_profile_id": render_profile_id,
         "tags": tags or [],
         "output_url": r["output_url"],
         "duration_seconds": r["duration_seconds"],
@@ -417,6 +500,49 @@ def _share_link_row(r: aiosqlite.Row) -> dict:
     }
 
 
+def _render_profile_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "resolution": r["resolution"],
+        "fps": r["fps"],
+        "codec": r["codec"],
+        "bitrate_kbps": r["bitrate_kbps"],
+        "quality_preset": r["quality_preset"],
+        "description": r["description"],
+        "created_at": r["created_at"],
+    }
+
+
+def _version_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "reel_id": r["reel_id"],
+        "version_number": r["version_number"],
+        "title": r["title"],
+        "style": r["style"],
+        "photo_urls": r["photo_urls"],
+        "render_settings": r["render_settings"],
+        "output_url": r["output_url"],
+        "created_at": r["created_at"],
+        "note": r["note"],
+    }
+
+
+def _calendar_slot_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "title": r["title"],
+        "planned_date": r["planned_date"],
+        "platform": r["platform"],
+        "reel_id": r["reel_id"],
+        "notes": r["notes"],
+        "status": r["status"],
+        "created_at": r["created_at"],
+        "updated_at": r["updated_at"],
+    }
+
+
 # -- Brands ------------------------------------------------------------------
 
 async def get_brand(db: aiosqlite.Connection, brand_id: int) -> dict | None:
@@ -492,6 +618,225 @@ async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
     return data
 
 
+# -- Render Profiles (v1.0.0) -----------------------------------------------
+
+async def create_render_profile(db: aiosqlite.Connection, data: dict) -> dict:
+    """Create a render profile with validated settings."""
+    resolution = data.get("resolution", "1080p")
+    if resolution not in VALID_RESOLUTIONS:
+        raise ValueError(f"Invalid resolution '{resolution}'. Must be one of: {', '.join(sorted(VALID_RESOLUTIONS))}")
+    fps = data.get("fps", 30)
+    if fps not in VALID_FPS:
+        raise ValueError(f"Invalid fps '{fps}'. Must be one of: {', '.join(str(f) for f in sorted(VALID_FPS))}")
+    codec = data.get("codec", "h264")
+    if codec not in VALID_CODECS:
+        raise ValueError(f"Invalid codec '{codec}'. Must be one of: {', '.join(sorted(VALID_CODECS))}")
+    quality_preset = data.get("quality_preset", "balanced")
+    if quality_preset not in VALID_QUALITY_PRESETS:
+        raise ValueError(f"Invalid quality_preset '{quality_preset}'. Must be one of: {', '.join(sorted(VALID_QUALITY_PRESETS))}")
+    bitrate_kbps = data.get("bitrate_kbps", 5000)
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO render_profiles (name, resolution, fps, codec, bitrate_kbps, quality_preset, description, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (data["name"], resolution, fps, codec, bitrate_kbps, quality_preset,
+         data.get("description"), now),
+    )
+    await db.commit()
+    return await get_render_profile(db, cur.lastrowid)
+
+
+async def list_render_profiles(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM render_profiles ORDER BY created_at DESC")
+    return [_render_profile_row(r) for r in rows]
+
+
+async def get_render_profile(db: aiosqlite.Connection, profile_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM render_profiles WHERE id = ?", (profile_id,))
+    if not rows:
+        return None
+    return _render_profile_row(rows[0])
+
+
+async def update_render_profile(db: aiosqlite.Connection, profile_id: int, updates: dict) -> dict | None:
+    existing = await get_render_profile(db, profile_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    # Validate fields
+    if "resolution" in fields and fields["resolution"] not in VALID_RESOLUTIONS:
+        raise ValueError(f"Invalid resolution. Must be one of: {', '.join(sorted(VALID_RESOLUTIONS))}")
+    if "fps" in fields and fields["fps"] not in VALID_FPS:
+        raise ValueError(f"Invalid fps. Must be one of: {', '.join(str(f) for f in sorted(VALID_FPS))}")
+    if "codec" in fields and fields["codec"] not in VALID_CODECS:
+        raise ValueError(f"Invalid codec. Must be one of: {', '.join(sorted(VALID_CODECS))}")
+    if "quality_preset" in fields and fields["quality_preset"] not in VALID_QUALITY_PRESETS:
+        raise ValueError(f"Invalid quality_preset. Must be one of: {', '.join(sorted(VALID_QUALITY_PRESETS))}")
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [profile_id]
+    cur = await db.execute(f"UPDATE render_profiles SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_render_profile(db, profile_id)
+
+
+async def delete_render_profile(db: aiosqlite.Connection, profile_id: int) -> str | bool:
+    """Delete a render profile. Returns 'in_use' if reels reference it, True on success, False if not found."""
+    rows = await db.execute_fetchall("SELECT id FROM render_profiles WHERE id = ?", (profile_id,))
+    if not rows:
+        return False
+    # Check if any reel_jobs use this profile
+    usage = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM reel_jobs WHERE render_profile_id = ?", (profile_id,))
+    if usage and usage[0]["c"] > 0:
+        return "in_use"
+    await db.execute("DELETE FROM render_profiles WHERE id = ?", (profile_id,))
+    await db.commit()
+    return True
+
+
+async def get_render_profile_usage(db: aiosqlite.Connection, profile_id: int) -> list[dict] | None:
+    """Get list of reels using a specific render profile."""
+    rows = await db.execute_fetchall("SELECT id FROM render_profiles WHERE id = ?", (profile_id,))
+    if not rows:
+        return None
+    reel_rows = await db.execute_fetchall(
+        "SELECT * FROM reel_jobs WHERE render_profile_id = ? ORDER BY created_at DESC", (profile_id,))
+    result = []
+    for r in reel_rows:
+        tags = await _get_reel_tags(db, r["id"])
+        result.append(_job_row(r, tags))
+    return result
+
+
+def apply_render_profile(job_data: dict, profile: dict) -> dict:
+    """Merge render profile settings into job render log data."""
+    resolution_map = {
+        "720p": "1280x720",
+        "1080p": "1920x1080",
+        "1440p": "2560x1440",
+        "4k": "3840x2160",
+    }
+    job_data["render_profile_settings"] = {
+        "profile_id": profile["id"],
+        "profile_name": profile["name"],
+        "resolution": resolution_map.get(profile["resolution"], "1920x1080"),
+        "fps": profile["fps"],
+        "codec": profile["codec"],
+        "bitrate_kbps": profile["bitrate_kbps"],
+        "quality_preset": profile["quality_preset"],
+    }
+    return job_data
+
+
+# -- Reel Versioning (v1.0.0) -----------------------------------------------
+
+async def _save_version(db: aiosqlite.Connection, reel_id: int, note: str | None = None) -> dict | None:
+    """Snapshot current reel state as a new version before modification."""
+    rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not rows:
+        return None
+    reel = rows[0]
+    # Get next version number
+    ver_rows = await db.execute_fetchall(
+        "SELECT MAX(version_number) as max_v FROM reel_versions WHERE reel_id = ?", (reel_id,))
+    next_version = 1
+    if ver_rows and ver_rows[0]["max_v"] is not None:
+        next_version = ver_rows[0]["max_v"] + 1
+    # Build render_settings snapshot
+    render_settings = {
+        "aspect_ratio": reel["aspect_ratio"],
+        "duration_target": reel["duration_target"],
+        "caption": reel["caption"],
+        "music_genre": reel["music_genre"],
+        "brand_color": reel["brand_color"],
+        "cta_text": reel["cta_text"],
+        "brand_id": reel["brand_id"],
+    }
+    try:
+        render_settings["render_profile_id"] = reel["render_profile_id"]
+    except (IndexError, KeyError):
+        pass
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO reel_versions
+           (reel_id, version_number, title, style, photo_urls, render_settings, output_url, created_at, note)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (reel_id, next_version, reel["title"], reel["style"], reel["photo_urls"],
+         json.dumps(render_settings), reel["output_url"], now, note),
+    )
+    await db.commit()
+    return await get_version(db, cur.lastrowid)
+
+
+async def list_versions(db: aiosqlite.Connection, reel_id: int) -> list[dict] | None:
+    """List all versions for a reel, ordered by version_number descending."""
+    reel_rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not reel_rows:
+        return None
+    rows = await db.execute_fetchall(
+        "SELECT * FROM reel_versions WHERE reel_id = ? ORDER BY version_number DESC", (reel_id,))
+    return [_version_row(r) for r in rows]
+
+
+async def get_version(db: aiosqlite.Connection, version_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM reel_versions WHERE id = ?", (version_id,))
+    if not rows:
+        return None
+    return _version_row(rows[0])
+
+
+async def revert_to_version(db: aiosqlite.Connection, reel_id: int, version_id: int) -> dict | str | None:
+    """Revert a reel to a previous version. Saves current state first, then applies the old version."""
+    reel_rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (reel_id,))
+    if not reel_rows:
+        return None
+    ver_rows = await db.execute_fetchall("SELECT * FROM reel_versions WHERE id = ?", (version_id,))
+    if not ver_rows:
+        return "version_not_found"
+    version = ver_rows[0]
+    if version["reel_id"] != reel_id:
+        return "version_wrong_reel"
+    # Save current state before reverting
+    await _save_version(db, reel_id, note=f"Auto-saved before revert to version {version['version_number']}")
+    # Parse render_settings from version
+    try:
+        settings = json.loads(version["render_settings"])
+    except (json.JSONDecodeError, TypeError):
+        settings = {}
+    # Apply version state to reel
+    now = _now()
+    await db.execute(
+        """UPDATE reel_jobs SET
+            title = ?, style = ?, photo_urls = ?,
+            aspect_ratio = ?, caption = ?, music_genre = ?,
+            brand_color = ?, cta_text = ?, duration_target = ?,
+            brand_id = ?, render_profile_id = ?,
+            status = 'queued', output_url = NULL,
+            duration_seconds = NULL, render_log = NULL, completed_at = NULL
+           WHERE id = ?""",
+        (version["title"], version["style"], version["photo_urls"],
+         settings.get("aspect_ratio", "9:16"),
+         settings.get("caption"),
+         settings.get("music_genre"),
+         settings.get("brand_color"),
+         settings.get("cta_text"),
+         settings.get("duration_target", 15),
+         settings.get("brand_id"),
+         settings.get("render_profile_id"),
+         reel_id),
+    )
+    await db.commit()
+    tags = await _get_reel_tags(db, reel_id)
+    updated = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (reel_id,))
+    return _job_row(updated[0], tags)
+
+
 # -- Reel Jobs ---------------------------------------------------------------
 
 async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
@@ -499,16 +844,17 @@ async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
     priority = data.get("priority", "normal")
     if priority not in VALID_PRIORITIES:
         priority = "normal"
+    render_profile_id = data.get("render_profile_id")
     now = _now()
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, brand_id, priority, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, render_profile_id, priority, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (data["title"], json.dumps(data["photo_urls"]), data.get("style", "dynamic"),
          data.get("aspect_ratio", "9:16"), data.get("caption"), data.get("music_genre"),
          data.get("brand_color"), data.get("cta_text"), data.get("duration_target", 15),
-         data.get("brand_id"), priority, now)
+         data.get("brand_id"), render_profile_id, priority, now)
     )
     reel_id = cur.lastrowid
     # Auto-add tags from request
@@ -641,6 +987,15 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
     photos = json.loads(job["photo_urls"])
     style_cfg = STYLE_CATALOG.get(job["style"], STYLE_CATALOG["dynamic"])
     await asyncio.sleep(0.5 + len(photos) * 0.2)
+
+    # Build render log, incorporating render profile if present
+    render_profile_id = None
+    try:
+        render_profile_id = job["render_profile_id"]
+    except (IndexError, KeyError):
+        pass
+
+    resolution = "1080x1920" if job["aspect_ratio"] == "9:16" else "1080x1080"
     log = {
         "photos_processed": len(photos),
         "style": job["style"],
@@ -648,8 +1003,15 @@ async def process_job(db: aiosqlite.Connection, job_id: int):
         "audio_track": job["music_genre"] or "none",
         "cta": job["cta_text"] or "",
         "brand_color": job["brand_color"] or "#000000",
-        "resolution": "1080x1920" if job["aspect_ratio"] == "9:16" else "1080x1080",
+        "resolution": resolution,
     }
+
+    # Apply render profile settings if present
+    if render_profile_id:
+        profile = await get_render_profile(db, render_profile_id)
+        if profile:
+            log = apply_render_profile(log, profile)
+
     output_url = f"https://cdn.reelforge.io/renders/{job_id}/output.mp4"
     duration = min(job["duration_target"], len(photos) * 3.5)
     now = _now()
@@ -722,17 +1084,24 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
     if not rows:
         return None
     src = rows[0]
+    # Save version before duplicate
+    await _save_version(db, job_id, note="Auto-saved before duplicate")
     now = _now()
     priority = "normal"
     try:
         priority = src["priority"] or "normal"
     except (IndexError, KeyError):
         pass
+    render_profile_id = None
+    try:
+        render_profile_id = src["render_profile_id"]
+    except (IndexError, KeyError):
+        pass
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, brand_id, priority, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, render_profile_id, priority, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (
             overrides.get("title") or f"{src['title']} (copy)",
             src["photo_urls"],
@@ -744,6 +1113,7 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
             overrides.get("cta_text") if "cta_text" in overrides else src["cta_text"],
             overrides.get("duration_target") or src["duration_target"],
             src["brand_id"],
+            render_profile_id,
             priority,
             now,
         )
@@ -1892,3 +2262,181 @@ async def get_share_stats(db: aiosqlite.Connection) -> dict:
         "total_downloads": total_downloads,
         "most_shared_reels": most_shared_reels,
     }
+
+
+# -- Content Calendar (v1.0.0) ----------------------------------------------
+
+async def create_calendar_slot(db: aiosqlite.Connection, data: dict) -> dict:
+    """Create a content calendar planning slot."""
+    platform = data.get("platform", "instagram")
+    if platform not in VALID_PLATFORMS:
+        raise ValueError(f"Invalid platform '{platform}'. Must be one of: {', '.join(sorted(VALID_PLATFORMS))}")
+    status = data.get("status", "planned")
+    if status not in VALID_CALENDAR_STATUSES:
+        raise ValueError(f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_CALENDAR_STATUSES))}")
+    # Validate date format
+    planned_date = data["planned_date"]
+    try:
+        datetime.strptime(planned_date, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError("Invalid date format. Must be YYYY-MM-DD")
+    # Validate reel_id if provided
+    reel_id = data.get("reel_id")
+    if reel_id is not None:
+        reel_rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
+        if not reel_rows:
+            raise ValueError(f"Reel {reel_id} not found")
+
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO calendar_slots (title, planned_date, platform, reel_id, notes, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (data["title"], planned_date, platform, reel_id, data.get("notes"), status, now),
+    )
+    await db.commit()
+    return await get_calendar_slot(db, cur.lastrowid)
+
+
+async def list_calendar_slots(db: aiosqlite.Connection, month: str | None = None,
+                               platform: str | None = None,
+                               status: str | None = None) -> list[dict]:
+    """List calendar slots with optional filters."""
+    q = "SELECT * FROM calendar_slots"
+    params: list = []
+    conditions = []
+    if month:
+        # month format: "2026-03"
+        conditions.append("planned_date LIKE ?")
+        params.append(f"{month}%")
+    if platform:
+        conditions.append("platform = ?")
+        params.append(platform)
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if conditions:
+        q += " WHERE " + " AND ".join(conditions)
+    q += " ORDER BY planned_date ASC, created_at ASC"
+    rows = await db.execute_fetchall(q, params)
+    return [_calendar_slot_row(r) for r in rows]
+
+
+async def get_calendar_slot(db: aiosqlite.Connection, slot_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM calendar_slots WHERE id = ?", (slot_id,))
+    if not rows:
+        return None
+    return _calendar_slot_row(rows[0])
+
+
+async def update_calendar_slot(db: aiosqlite.Connection, slot_id: int, updates: dict) -> dict | None:
+    existing = await get_calendar_slot(db, slot_id)
+    if not existing:
+        return None
+    fields = {k: v for k, v in updates.items() if v is not None}
+    if not fields:
+        return existing
+    # Validate fields
+    if "platform" in fields and fields["platform"] not in VALID_PLATFORMS:
+        raise ValueError(f"Invalid platform. Must be one of: {', '.join(sorted(VALID_PLATFORMS))}")
+    if "status" in fields and fields["status"] not in VALID_CALENDAR_STATUSES:
+        raise ValueError(f"Invalid status. Must be one of: {', '.join(sorted(VALID_CALENDAR_STATUSES))}")
+    if "planned_date" in fields:
+        try:
+            datetime.strptime(fields["planned_date"], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Invalid date format. Must be YYYY-MM-DD")
+    if "reel_id" in fields and fields["reel_id"] is not None:
+        reel_rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (fields["reel_id"],))
+        if not reel_rows:
+            raise ValueError(f"Reel {fields['reel_id']} not found")
+    fields["updated_at"] = _now()
+    set_clause = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [slot_id]
+    cur = await db.execute(f"UPDATE calendar_slots SET {set_clause} WHERE id = ?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_calendar_slot(db, slot_id)
+
+
+async def delete_calendar_slot(db: aiosqlite.Connection, slot_id: int) -> bool:
+    cur = await db.execute("DELETE FROM calendar_slots WHERE id = ?", (slot_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_calendar_overview(db: aiosqlite.Connection, month: str) -> dict:
+    """Monthly overview with slots per platform, per day, gap detection, coverage %."""
+    # Parse month to get total days
+    try:
+        year, mon = int(month[:4]), int(month[5:7])
+    except (ValueError, IndexError):
+        raise ValueError("Invalid month format. Must be YYYY-MM")
+    total_days = cal_mod.monthrange(year, mon)[1]
+
+    rows = await db.execute_fetchall(
+        "SELECT * FROM calendar_slots WHERE planned_date LIKE ?", (f"{month}%",))
+
+    slots_per_platform: dict[str, int] = {}
+    slots_per_day: dict[str, int] = {}
+    days_with_slots: set[str] = set()
+
+    for r in rows:
+        plat = r["platform"]
+        day = r["planned_date"]
+        slots_per_platform[plat] = slots_per_platform.get(plat, 0) + 1
+        slots_per_day[day] = slots_per_day.get(day, 0) + 1
+        days_with_slots.add(day)
+
+    # Find gap days (days with no content planned)
+    all_days = []
+    for d in range(1, total_days + 1):
+        date_str = f"{month}-{d:02d}"
+        all_days.append(date_str)
+
+    gap_days = [d for d in all_days if d not in days_with_slots]
+    coverage_pct = round(len(days_with_slots) / total_days * 100, 1) if total_days > 0 else 0.0
+
+    return {
+        "month": month,
+        "total_slots": len(rows),
+        "slots_per_platform": slots_per_platform,
+        "slots_per_day": slots_per_day,
+        "gap_days": gap_days,
+        "total_days": total_days,
+        "coverage_pct": coverage_pct,
+    }
+
+
+async def get_calendar_gaps(db: aiosqlite.Connection, month: str,
+                             platforms: list[str] | None = None) -> list[dict]:
+    """Find days without content for specific platforms (or all platforms if none specified)."""
+    try:
+        year, mon = int(month[:4]), int(month[5:7])
+    except (ValueError, IndexError):
+        raise ValueError("Invalid month format. Must be YYYY-MM")
+    total_days = cal_mod.monthrange(year, mon)[1]
+
+    target_platforms = platforms if platforms else sorted(VALID_PLATFORMS)
+    # Validate platforms
+    for p in target_platforms:
+        if p not in VALID_PLATFORMS:
+            raise ValueError(f"Invalid platform '{p}'. Must be one of: {', '.join(sorted(VALID_PLATFORMS))}")
+
+    rows = await db.execute_fetchall(
+        "SELECT planned_date, platform FROM calendar_slots WHERE planned_date LIKE ?",
+        (f"{month}%",))
+
+    # Build set of (date, platform) pairs
+    covered: set[tuple[str, str]] = set()
+    for r in rows:
+        covered.add((r["planned_date"], r["platform"]))
+
+    gaps = []
+    for d in range(1, total_days + 1):
+        date_str = f"{month}-{d:02d}"
+        missing = [p for p in target_platforms if (date_str, p) not in covered]
+        if missing:
+            gaps.append({"date": date_str, "missing_platforms": missing})
+
+    return gaps

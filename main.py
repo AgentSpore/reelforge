@@ -23,6 +23,10 @@ from models import (
     VALID_TEMPLATE_CATEGORIES,
     CommentCreate, CommentUpdate, CommentResponse, CommentStats,
     ShareLinkCreate, ShareLinkResponse, ShareLinkAccess, ShareLinkStats,
+    RenderProfileCreate, RenderProfileUpdate, RenderProfileResponse,
+    ReelVersionResponse,
+    CalendarSlotCreate, CalendarSlotUpdate, CalendarSlotResponse,
+    CalendarOverview, CalendarGap,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
@@ -45,6 +49,15 @@ from engine import (
     resolve_comment, get_comment_stats,
     create_share_link, list_share_links, get_share_link_by_token,
     access_share_link, record_download, revoke_share_link, get_share_stats,
+    # v1.0.0 — Render Profiles
+    create_render_profile, list_render_profiles, get_render_profile,
+    update_render_profile, delete_render_profile, get_render_profile_usage,
+    # v1.0.0 — Reel Versioning
+    list_versions, get_version, revert_to_version, _save_version,
+    # v1.0.0 — Content Calendar
+    create_calendar_slot, list_calendar_slots, get_calendar_slot,
+    update_calendar_slot, delete_calendar_slot,
+    get_calendar_overview, get_calendar_gaps,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -63,9 +76,10 @@ app = FastAPI(
         "Product photo to marketing reel generator. Submit photos, choose style, "
         "get a ready-to-post reel. Supports brand profiles, collections, A/B testing, "
         "engagement tracking, render queue with priorities, reel tags, webhooks, "
-        "scheduled publishing, reel templates, team comments, share links, and analytics."
+        "scheduled publishing, reel templates, team comments, share links, "
+        "render profiles, reel versioning, content calendar, and analytics."
     ),
-    version="0.9.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -73,7 +87,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.9.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 # -- Brands ------------------------------------------------------------------
@@ -525,6 +539,191 @@ async def remove_share_link(link_id: int):
         raise HTTPException(404, "Share link not found")
 
 
+# -- Render Profiles (v1.0.0) -----------------------------------------------
+
+@app.post("/render-profiles", response_model=RenderProfileResponse, status_code=201)
+async def add_render_profile(body: RenderProfileCreate):
+    """Create a custom render quality preset."""
+    try:
+        return await create_render_profile(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+
+
+@app.get("/render-profiles", response_model=list[RenderProfileResponse])
+async def get_render_profiles():
+    """List all render profiles."""
+    return await list_render_profiles(app.state.db)
+
+
+@app.get("/render-profiles/{profile_id}", response_model=RenderProfileResponse)
+async def get_render_profile_detail(profile_id: int):
+    """Get a render profile by ID."""
+    profile = await get_render_profile(app.state.db, profile_id)
+    if not profile:
+        raise HTTPException(404, "Render profile not found")
+    return profile
+
+
+@app.patch("/render-profiles/{profile_id}", response_model=RenderProfileResponse)
+async def patch_render_profile(profile_id: int, body: RenderProfileUpdate):
+    """Update a render profile."""
+    try:
+        result = await update_render_profile(app.state.db, profile_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+    if not result:
+        raise HTTPException(404, "Render profile not found")
+    return result
+
+
+@app.delete("/render-profiles/{profile_id}", status_code=204)
+async def remove_render_profile(profile_id: int):
+    """Delete a render profile. Fails 409 if in use by reels."""
+    result = await delete_render_profile(app.state.db, profile_id)
+    if result is False:
+        raise HTTPException(404, "Render profile not found")
+    if result == "in_use":
+        raise HTTPException(409, "Render profile is in use by one or more reels and cannot be deleted")
+
+
+@app.get("/render-profiles/{profile_id}/usage", response_model=list[ReelJob])
+async def render_profile_usage(profile_id: int):
+    """List reels using this render profile."""
+    result = await get_render_profile_usage(app.state.db, profile_id)
+    if result is None:
+        raise HTTPException(404, "Render profile not found")
+    return result
+
+
+# -- Reel Versioning (v1.0.0) -----------------------------------------------
+
+@app.get("/reels/{reel_id}/versions", response_model=list[ReelVersionResponse])
+async def get_reel_versions(reel_id: int):
+    """List all versions of a reel."""
+    result = await list_versions(app.state.db, reel_id)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    return result
+
+
+@app.get("/versions/{version_id}", response_model=ReelVersionResponse)
+async def get_version_detail(version_id: int):
+    """Get a specific version."""
+    result = await get_version(app.state.db, version_id)
+    if not result:
+        raise HTTPException(404, "Version not found")
+    return result
+
+
+@app.post("/reels/{reel_id}/revert/{version_id}", response_model=ReelJob)
+async def revert_reel(reel_id: int, version_id: int, background_tasks: BackgroundTasks):
+    """Revert a reel to a previous version. Saves current state first, then re-triggers render."""
+    try:
+        result = await revert_to_version(app.state.db, reel_id, version_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "version_not_found":
+        raise HTTPException(404, "Version not found")
+    if result == "version_wrong_reel":
+        raise HTTPException(422, "Version does not belong to this reel")
+    # Re-trigger render
+    background_tasks.add_task(process_job, app.state.db, reel_id)
+    return result
+
+
+# -- Content Calendar (v1.0.0) ----------------------------------------------
+
+@app.post("/calendar", response_model=CalendarSlotResponse, status_code=201)
+async def add_calendar_slot(body: CalendarSlotCreate):
+    """Create a content calendar planning slot."""
+    try:
+        return await create_calendar_slot(app.state.db, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+
+
+@app.get("/calendar/overview", response_model=CalendarOverview)
+async def calendar_overview(
+    month: str = Query(..., description="Month in YYYY-MM format, e.g. 2026-03"),
+):
+    """Monthly overview: slots per platform/day, gap detection, coverage %."""
+    try:
+        return await get_calendar_overview(app.state.db, month)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+
+
+@app.get("/calendar/gaps", response_model=list[CalendarGap])
+async def calendar_gaps(
+    month: str = Query(..., description="Month in YYYY-MM format, e.g. 2026-03"),
+    platforms: str | None = Query(None, description="Comma-separated platforms to check, e.g. instagram,tiktok"),
+):
+    """Find days without content for specific platforms."""
+    try:
+        platform_list = None
+        if platforms:
+            platform_list = [p.strip() for p in platforms.split(",") if p.strip()]
+        return await get_calendar_gaps(app.state.db, month, platform_list)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+
+
+@app.get("/calendar", response_model=list[CalendarSlotResponse])
+async def get_calendar(
+    month: str | None = Query(None, description="Filter by month (YYYY-MM)"),
+    platform: str | None = Query(None, description="Filter by platform"),
+    status: str | None = Query(None, description="Filter by status: planned | assigned | published | skipped"),
+):
+    """List calendar slots with optional filters."""
+    return await list_calendar_slots(app.state.db, month, platform, status)
+
+
+@app.get("/calendar/{slot_id}", response_model=CalendarSlotResponse)
+async def get_calendar_slot_detail(slot_id: int):
+    """Get a calendar slot by ID."""
+    slot = await get_calendar_slot(app.state.db, slot_id)
+    if not slot:
+        raise HTTPException(404, "Calendar slot not found")
+    return slot
+
+
+@app.patch("/calendar/{slot_id}", response_model=CalendarSlotResponse)
+async def patch_calendar_slot(slot_id: int, body: CalendarSlotUpdate):
+    """Update a calendar slot."""
+    try:
+        result = await update_calendar_slot(app.state.db, slot_id, body.model_dump(exclude_unset=True))
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Internal error: {e}")
+    if not result:
+        raise HTTPException(404, "Calendar slot not found")
+    return result
+
+
+@app.delete("/calendar/{slot_id}", status_code=204)
+async def remove_calendar_slot(slot_id: int):
+    """Delete a calendar slot."""
+    ok = await delete_calendar_slot(app.state.db, slot_id)
+    if not ok:
+        raise HTTPException(404, "Calendar slot not found")
+
+
 # -- Reels -------------------------------------------------------------------
 
 @app.post("/reels", response_model=ReelJob, status_code=201)
@@ -537,6 +736,10 @@ async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks
         b = await get_brand(app.state.db, body.brand_id)
         if not b:
             raise HTTPException(404, "Brand not found")
+    if body.render_profile_id:
+        profile = await get_render_profile(app.state.db, body.render_profile_id)
+        if not profile:
+            raise HTTPException(404, "Render profile not found")
     job = await create_job(app.state.db, body.model_dump())
     background_tasks.add_task(process_job, app.state.db, job["id"])
     return job
@@ -551,6 +754,10 @@ async def create_reels_batch(body: BatchCreateRequest, background_tasks: Backgro
         b = await get_brand(app.state.db, body.brand_id)
         if not b:
             raise HTTPException(404, "Brand not found")
+    if body.render_profile_id:
+        profile = await get_render_profile(app.state.db, body.render_profile_id)
+        if not profile:
+            raise HTTPException(404, "Render profile not found")
     jobs = await batch_create_jobs(app.state.db, body.model_dump())
     for job in jobs:
         background_tasks.add_task(process_job, app.state.db, job["id"])
@@ -589,6 +796,8 @@ async def retry_reel(job_id: int, background_tasks: BackgroundTasks):
         raise HTTPException(404, "Reel job not found")
     if job["status"] not in ("failed", "queued"):
         raise HTTPException(422, "Only failed or queued jobs can be retried")
+    # Save version before retry
+    await _save_version(app.state.db, job_id, note="Auto-saved before retry")
     await app.state.db.execute("UPDATE reel_jobs SET status = 'queued' WHERE id = ?", (job_id,))
     await app.state.db.commit()
     background_tasks.add_task(process_job, app.state.db, job_id)
