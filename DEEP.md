@@ -1,33 +1,29 @@
-# ReelForge — Architecture (DEEP.md)
-
-## Overview
-Product photo to marketing reel generator. Upload photos, pick a style, get a ready-to-post video reel.
+# ReelForge — Architecture
 
 ## Stack
-- Python 3.11+ / FastAPI / uvicorn
-- SQLite (aiosqlite) with WAL mode
-- Pydantic v2, background tasks for async rendering
+- Python 3.11+ / FastAPI / aiosqlite / Pydantic v2
 
-## Data Model
-```
-reel_jobs (id, title, photo_urls JSON, style, aspect_ratio, caption, music_genre,
-           brand_color, cta_text, duration_target, brand_id FK, status, output_url,
-           duration_seconds, render_log JSON, created_at, completed_at)
-brands (id, name, brand_color, logo_url, default_cta, default_music_genre, default_style)
-```
+## Database
+- SQLite WAL mode, tables: reel_jobs, brands, engagement_events
+- Migrations run on startup (brand_id column, engagement table)
 
-## Render Pipeline
-1. Job created with status=queued
-2. Background task: queued -> processing -> completed
-3. Simulated render: style transitions, audio track, CTA overlay, brand color
-4. Output URL generated, render_log stored as JSON
+## Features (v0.6.0)
+1. Brands CRUD with default style/color/CTA inheritance
+2. Reels CRUD + batch create + duplicate + retry + search
+3. Render pipeline (simulated) with render log
+4. 5 reel styles: dynamic, minimal, luxury, playful, cinematic
+5. 5 reel presets: product_showcase, unboxing, before_after, tutorial, testimonial
+6. Engagement tracking: view/like/share/click/save per reel with engagement rate
+7. Brand analytics: per-brand performance, completion rate, avg render time
+8. Daily analytics + per-style stats
 
-## 5 Style Presets
-dynamic, minimal, luxury, playful, cinematic — each with unique transitions
-
-## Key Endpoints (20 total)
-- Brands: CRUD (POST/GET/GET:id/PATCH/DELETE)
-- Reels: POST, POST /reels/batch, GET, GET /reels/search, GET:id, DELETE
-- Reel actions: POST retry, POST duplicate, GET render-log
-- Styles: GET /styles
-- Analytics: GET /analytics/daily, GET /stats/by-style, GET /stats
+## Endpoints (25)
+- GET /health
+- POST/GET /brands, GET/PATCH/DELETE /brands/{id}
+- POST /reels, POST /reels/batch, GET /reels, GET /reels/search
+- GET /reels/{id}, DELETE /reels/{id}
+- GET /reels/{id}/render-log, POST /reels/{id}/retry, POST /reels/{id}/duplicate
+- POST /reels/{id}/engagement, GET /reels/{id}/engagement
+- GET /styles, GET /presets, GET /presets/{name}
+- GET /analytics/daily, GET /analytics/engagement, GET /analytics/brands
+- GET /stats/by-style, GET /stats

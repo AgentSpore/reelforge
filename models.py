@@ -128,3 +128,63 @@ class DailyAnalyticsEntry(BaseModel):
     completed: int
     failed: int
     top_style: Optional[str]
+
+
+# ── Reel Presets ────────────────────────────────────────────────────────────
+
+class ReelPresetInfo(BaseModel):
+    name: str
+    description: str
+    recommended_photos: int
+    recommended_style: str
+    recommended_aspect: str
+    recommended_duration: int
+    recommended_music: str
+    scene_flow: list[str]
+
+
+# ── Engagement ──────────────────────────────────────────────────────────────
+
+class EngagementEventCreate(BaseModel):
+    event_type: str = Field(..., description="view | like | share | click | save")
+    source: Optional[str] = Field(None, description="Traffic source: instagram | tiktok | facebook | organic | ads")
+
+
+class EngagementSummary(BaseModel):
+    reel_id: int
+    views: int
+    likes: int
+    shares: int
+    clicks: int
+    saves: int
+    total_events: int
+    engagement_rate: float = Field(..., description="(likes+shares+saves+clicks)/views * 100")
+
+
+class EngagementTopReel(BaseModel):
+    reel_id: int
+    title: str
+    style: str
+    status: str
+    views: int
+    likes: int
+    shares: int
+    clicks: int
+    saves: int
+    total_events: int
+    engagement_rate: float
+
+
+# ── Brand Analytics ─────────────────────────────────────────────────────────
+
+class BrandAnalyticsEntry(BaseModel):
+    brand_id: int
+    brand_name: str
+    total_reels: int
+    completed: int
+    failed: int
+    completion_rate: float
+    avg_duration_seconds: float
+    top_style: Optional[str]
+    total_views: int
+    engagement_rate: float
