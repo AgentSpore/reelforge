@@ -6,14 +6,17 @@ from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
-    CreateReelRequest, DuplicateReelRequest, ReelJob, ReelListItem,
+    CreateReelRequest, BatchCreateRequest, DuplicateReelRequest,
+    ReelJob, ReelListItem,
     StyleInfo, StatsResponse, RenderLogResponse,
     BrandCreate, BrandUpdate, BrandResponse,
+    DailyAnalyticsEntry,
 )
 from engine import (
-    init_db, create_job, list_jobs, get_job, get_render_log, process_job,
+    init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
+    get_job, get_render_log, process_job,
     delete_job, get_stats, STYLE_CATALOG,
-    duplicate_job, get_stats_by_style,
+    duplicate_job, get_stats_by_style, get_daily_analytics,
     create_brand, list_brands, get_brand, update_brand, delete_brand,
 )
 
@@ -30,7 +33,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="ReelForge",
     description="Product photo to marketing reel generator. Submit photos, choose style, get a ready-to-post reel.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -38,7 +41,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 
 # ── Brands ───────────────────────────────────────────────────────────────
@@ -87,6 +90,31 @@ async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks
     job = await create_job(app.state.db, body.model_dump())
     background_tasks.add_task(process_job, app.state.db, job["id"])
     return job
+
+
+@app.post("/reels/batch", response_model=list[ReelJob], status_code=201)
+async def create_reels_batch(body: BatchCreateRequest, background_tasks: BackgroundTasks):
+    """Create multiple reels from the same photo set with different styles — ideal for A/B testing."""
+    invalid = [s for s in body.styles if s not in STYLE_CATALOG]
+    if invalid:
+        raise HTTPException(422, f"Unknown styles: {', '.join(invalid)}")
+    if body.brand_id:
+        b = await get_brand(app.state.db, body.brand_id)
+        if not b:
+            raise HTTPException(404, "Brand not found")
+    jobs = await batch_create_jobs(app.state.db, body.model_dump())
+    for job in jobs:
+        background_tasks.add_task(process_job, app.state.db, job["id"])
+    return jobs
+
+
+@app.get("/reels/search", response_model=list[ReelListItem])
+async def search_reels(
+    q: str = Query(..., min_length=1, description="Search query (matches title)"),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Search reel jobs by title."""
+    return await search_jobs(app.state.db, q, limit)
 
 
 @app.get("/reels", response_model=list[ReelListItem])
@@ -155,6 +183,16 @@ async def list_styles():
                   best_for=v["best_for"], transitions=v["transitions"])
         for k, v in STYLE_CATALOG.items()
     ]
+
+
+# ── Analytics ────────────────────────────────────────────────────────────
+
+@app.get("/analytics/daily", response_model=list[DailyAnalyticsEntry])
+async def daily_analytics(
+    days: int = Query(30, ge=1, le=365, description="Number of days to look back"),
+):
+    """Daily breakdown: reels created, completed, failed, top style per day."""
+    return await get_daily_analytics(app.state.db, days)
 
 
 @app.get("/stats/by-style")
