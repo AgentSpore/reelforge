@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS brands (
 
 MIGRATION_BRAND_ID = "ALTER TABLE reel_jobs ADD COLUMN brand_id INTEGER;"
 
+VALID_PRIORITIES = {"low", "normal", "high", "urgent"}
+PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+
 STYLE_CATALOG = {
     "dynamic":   {"description": "Fast cuts, energetic transitions", "best_for": "Sports, tech gadgets, fashion",
                   "transitions": ["zoom_in", "slide_left", "whip_pan", "flash"]},
@@ -115,12 +118,14 @@ async def init_db(path: str) -> aiosqlite.Connection:
         except Exception:
             pass
     await _migrate_engagement(db)
+    await _migrate_priority(db)
+    await _migrate_collections(db)
+    await _migrate_ab_tests(db)
     await db.commit()
     return db
 
 
 async def _migrate_engagement(db: aiosqlite.Connection):
-    """Create engagement_events table if it doesn't exist."""
     await db.execute("""
         CREATE TABLE IF NOT EXISTS engagement_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,6 +138,55 @@ async def _migrate_engagement(db: aiosqlite.Connection):
     """)
 
 
+async def _migrate_priority(db: aiosqlite.Connection):
+    try:
+        await db.execute("SELECT priority FROM reel_jobs LIMIT 1")
+    except Exception:
+        try:
+            await db.execute("ALTER TABLE reel_jobs ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+        except Exception:
+            pass
+
+
+async def _migrate_collections(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS collection_reels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_id INTEGER NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+            reel_id INTEGER NOT NULL REFERENCES reel_jobs(id) ON DELETE CASCADE,
+            added_at TEXT NOT NULL,
+            UNIQUE(collection_id, reel_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cr_collection ON collection_reels(collection_id);
+        CREATE INDEX IF NOT EXISTS idx_cr_reel ON collection_reels(reel_id);
+    """)
+
+
+async def _migrate_ab_tests(db: aiosqlite.Connection):
+    await db.executescript("""
+        CREATE TABLE IF NOT EXISTS ab_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            winner_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ab_test_reels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id INTEGER NOT NULL REFERENCES ab_tests(id) ON DELETE CASCADE,
+            reel_id INTEGER NOT NULL REFERENCES reel_jobs(id) ON DELETE CASCADE,
+            UNIQUE(test_id, reel_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_abtr_test ON ab_test_reels(test_id);
+    """)
+
+
 def _job_row(r: aiosqlite.Row) -> dict:
     render_log = None
     if r["render_log"]:
@@ -140,11 +194,17 @@ def _job_row(r: aiosqlite.Row) -> dict:
             render_log = json.loads(r["render_log"])
         except Exception:
             pass
+    priority = "normal"
+    try:
+        priority = r["priority"]
+    except (IndexError, KeyError):
+        pass
     return {
         "id": r["id"], "title": r["title"],
         "photo_urls": json.loads(r["photo_urls"]),
         "style": r["style"], "aspect_ratio": r["aspect_ratio"],
-        "status": r["status"], "brand_id": r["brand_id"],
+        "status": r["status"], "priority": priority or "normal",
+        "brand_id": r["brand_id"],
         "output_url": r["output_url"],
         "duration_seconds": r["duration_seconds"],
         "render_log": render_log,
@@ -218,7 +278,6 @@ async def delete_brand(db: aiosqlite.Connection, brand_id: int) -> bool:
 
 
 async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
-    """Apply brand profile defaults to reel creation data. Explicit values override brand defaults."""
     brand_id = data.get("brand_id")
     if not brand_id:
         return data
@@ -238,16 +297,19 @@ async def apply_brand_defaults(db: aiosqlite.Connection, data: dict) -> dict:
 
 async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
     data = await apply_brand_defaults(db, data)
+    priority = data.get("priority", "normal")
+    if priority not in VALID_PRIORITIES:
+        priority = "normal"
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, brand_id, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, priority, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (data["title"], json.dumps(data["photo_urls"]), data.get("style", "dynamic"),
          data.get("aspect_ratio", "9:16"), data.get("caption"), data.get("music_genre"),
          data.get("brand_color"), data.get("cta_text"), data.get("duration_target", 15),
-         data.get("brand_id"), now)
+         data.get("brand_id"), priority, now)
     )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs WHERE id = ?", (cur.lastrowid,))
@@ -255,7 +317,6 @@ async def create_job(db: aiosqlite.Connection, data: dict) -> dict:
 
 
 async def batch_create_jobs(db: aiosqlite.Connection, data: dict) -> list[dict]:
-    """Create multiple reel jobs from the same photo set with different styles."""
     styles = data["styles"]
     base = {k: v for k, v in data.items() if k != "styles"}
     jobs = []
@@ -275,26 +336,43 @@ async def list_jobs(db: aiosqlite.Connection, status: str | None = None, limit: 
     q += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     rows = await db.execute_fetchall(q, params)
-    return [{
-        "id": r["id"], "title": r["title"], "style": r["style"],
-        "aspect_ratio": r["aspect_ratio"], "status": r["status"],
-        "photo_count": len(json.loads(r["photo_urls"])),
-        "created_at": r["created_at"],
-    } for r in rows]
+    result = []
+    for r in rows:
+        priority = "normal"
+        try:
+            priority = r["priority"]
+        except (IndexError, KeyError):
+            pass
+        result.append({
+            "id": r["id"], "title": r["title"], "style": r["style"],
+            "aspect_ratio": r["aspect_ratio"], "status": r["status"],
+            "priority": priority or "normal",
+            "photo_count": len(json.loads(r["photo_urls"])),
+            "created_at": r["created_at"],
+        })
+    return result
 
 
 async def search_jobs(db: aiosqlite.Connection, query: str, limit: int = 50) -> list[dict]:
-    """Search reel jobs by title (case-insensitive LIKE)."""
     rows = await db.execute_fetchall(
         "SELECT * FROM reel_jobs WHERE title LIKE ? ORDER BY created_at DESC LIMIT ?",
         (f"%{query}%", limit),
     )
-    return [{
-        "id": r["id"], "title": r["title"], "style": r["style"],
-        "aspect_ratio": r["aspect_ratio"], "status": r["status"],
-        "photo_count": len(json.loads(r["photo_urls"])),
-        "created_at": r["created_at"],
-    } for r in rows]
+    result = []
+    for r in rows:
+        priority = "normal"
+        try:
+            priority = r["priority"]
+        except (IndexError, KeyError):
+            pass
+        result.append({
+            "id": r["id"], "title": r["title"], "style": r["style"],
+            "aspect_ratio": r["aspect_ratio"], "status": r["status"],
+            "priority": priority or "normal",
+            "photo_count": len(json.loads(r["photo_urls"])),
+            "created_at": r["created_at"],
+        })
+    return result
 
 
 async def get_job(db: aiosqlite.Connection, job_id: int) -> dict | None:
@@ -363,10 +441,12 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     rows = await db.execute_fetchall("SELECT * FROM reel_jobs")
     brand_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM brands")
     total_brands = brand_cnt[0]["c"] if brand_cnt else 0
+    coll_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM collections")
+    total_collections = coll_cnt[0]["c"] if coll_cnt else 0
     if not rows:
         return {"total_jobs": 0, "completed": 0, "processing": 0, "failed": 0,
                 "avg_duration_seconds": 0.0, "most_used_style": None, "most_used_ratio": None,
-                "total_brands": total_brands}
+                "total_brands": total_brands, "total_collections": total_collections}
     total = len(rows)
     completed = sum(1 for r in rows if r["status"] == "completed")
     processing = sum(1 for r in rows if r["status"] == "processing")
@@ -385,6 +465,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "most_used_style": max(style_counts, key=style_counts.get) if style_counts else None,
         "most_used_ratio": max(ratio_counts, key=ratio_counts.get) if ratio_counts else None,
         "total_brands": total_brands,
+        "total_collections": total_collections,
     }
 
 
@@ -394,11 +475,16 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
         return None
     src = rows[0]
     now = datetime.now(timezone.utc).isoformat()
+    priority = "normal"
+    try:
+        priority = src["priority"] or "normal"
+    except (IndexError, KeyError):
+        pass
     cur = await db.execute(
         """INSERT INTO reel_jobs
            (title, photo_urls, style, aspect_ratio, caption, music_genre, brand_color,
-            cta_text, duration_target, brand_id, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
+            cta_text, duration_target, brand_id, priority, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)""",
         (
             overrides.get("title") or f"{src['title']} (copy)",
             src["photo_urls"],
@@ -410,6 +496,7 @@ async def duplicate_job(db: aiosqlite.Connection, job_id: int, overrides: dict) 
             overrides.get("cta_text") if "cta_text" in overrides else src["cta_text"],
             overrides.get("duration_target") or src["duration_target"],
             src["brand_id"],
+            priority,
             now,
         )
     )
@@ -442,7 +529,6 @@ async def get_stats_by_style(db: aiosqlite.Connection) -> list[dict]:
 
 
 async def get_daily_analytics(db: aiosqlite.Connection, days: int = 30) -> list[dict]:
-    """Daily breakdown of reel jobs: created, completed, failed for the last N days."""
     since = (datetime.utcnow() - timedelta(days=days)).date().isoformat()
     rows = await db.execute_fetchall(
         "SELECT * FROM reel_jobs WHERE date(created_at) >= ?", (since,)
@@ -474,7 +560,6 @@ VALID_ENGAGEMENT_TYPES = {"view", "like", "share", "click", "save"}
 
 async def record_engagement(db: aiosqlite.Connection, reel_id: int,
                             event_type: str, source: str | None = None) -> dict | None:
-    """Record an engagement event for a reel. Returns updated engagement summary."""
     rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
     if not rows:
         return None
@@ -488,7 +573,6 @@ async def record_engagement(db: aiosqlite.Connection, reel_id: int,
 
 
 async def get_reel_engagement(db: aiosqlite.Connection, reel_id: int) -> dict | None:
-    """Get engagement summary for a reel: counts per event type + totals."""
     rows = await db.execute_fetchall("SELECT id FROM reel_jobs WHERE id = ?", (reel_id,))
     if not rows:
         return None
@@ -501,7 +585,6 @@ async def get_reel_engagement(db: aiosqlite.Connection, reel_id: int) -> dict | 
     for e in events:
         counts[e["event_type"]] = e["cnt"]
         total += e["cnt"]
-    # Engagement rate: (likes + shares + saves + clicks) / views * 100
     views = counts.get("view", 0)
     interactions = counts.get("like", 0) + counts.get("share", 0) + counts.get("save", 0) + counts.get("click", 0)
     engagement_rate = round(interactions / views * 100, 1) if views > 0 else 0.0
@@ -519,7 +602,6 @@ async def get_reel_engagement(db: aiosqlite.Connection, reel_id: int) -> dict | 
 
 async def get_engagement_analytics(db: aiosqlite.Connection, limit: int = 20,
                                    sort_by: str = "engagement_rate") -> list[dict]:
-    """Top performing reels ranked by engagement metrics."""
     reel_ids = await db.execute_fetchall(
         "SELECT DISTINCT reel_id FROM engagement_events"
     )
@@ -544,7 +626,6 @@ async def get_engagement_analytics(db: aiosqlite.Connection, limit: int = 20,
 # ── Brand Analytics ────────────────────────────────────────────────────────
 
 async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
-    """Per-brand performance breakdown: reels, completion rate, avg render time, top style."""
     brands = await db.execute_fetchall("SELECT * FROM brands ORDER BY name ASC")
     results = []
     for b in brands:
@@ -562,7 +643,6 @@ async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
         for r in reels:
             style_counts[r["style"]] = style_counts.get(r["style"], 0) + 1
         top_style = max(style_counts, key=style_counts.get) if style_counts else None
-        # Engagement totals for brand
         engagement = await db.execute_fetchall(
             """SELECT event_type, COUNT(*) as cnt
                FROM engagement_events WHERE reel_id IN (SELECT id FROM reel_jobs WHERE brand_id = ?)
@@ -586,3 +666,260 @@ async def get_brand_analytics(db: aiosqlite.Connection) -> list[dict]:
             "engagement_rate": eng_rate,
         })
     return results
+
+
+# ── Collections ────────────────────────────────────────────────────────────
+
+async def create_collection(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO collections (name, description, created_at) VALUES (?, ?, ?)",
+        (data["name"], data.get("description"), now),
+    )
+    await db.commit()
+    return await get_collection(db, cur.lastrowid)
+
+
+async def get_collection(db: aiosqlite.Connection, collection_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM collections WHERE id = ?", (collection_id,))
+    if not rows:
+        return None
+    cnt = await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM collection_reels WHERE collection_id = ?", (collection_id,))
+    r = rows[0]
+    return {
+        "id": r["id"], "name": r["name"], "description": r["description"],
+        "reel_count": cnt[0]["c"] if cnt else 0, "created_at": r["created_at"],
+    }
+
+
+async def list_collections(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM collections ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        cnt = await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM collection_reels WHERE collection_id = ?", (r["id"],))
+        result.append({
+            "id": r["id"], "name": r["name"], "description": r["description"],
+            "reel_count": cnt[0]["c"] if cnt else 0, "created_at": r["created_at"],
+        })
+    return result
+
+
+async def delete_collection(db: aiosqlite.Connection, collection_id: int) -> bool:
+    rows = await db.execute_fetchall("SELECT id FROM collections WHERE id = ?", (collection_id,))
+    if not rows:
+        return False
+    await db.execute("DELETE FROM collection_reels WHERE collection_id = ?", (collection_id,))
+    await db.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+    await db.commit()
+    return True
+
+
+async def add_reel_to_collection(db: aiosqlite.Connection, collection_id: int, reel_id: int) -> dict | str | None:
+    coll = await get_collection(db, collection_id)
+    if not coll:
+        return None
+    reel = await get_job(db, reel_id)
+    if not reel:
+        return "reel_not_found"
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO collection_reels (collection_id, reel_id, added_at) VALUES (?, ?, ?)",
+            (collection_id, reel_id, now),
+        )
+        await db.commit()
+    except Exception:
+        pass  # already exists
+    return await get_collection(db, collection_id)
+
+
+async def remove_reel_from_collection(db: aiosqlite.Connection, collection_id: int, reel_id: int) -> dict | None:
+    coll = await get_collection(db, collection_id)
+    if not coll:
+        return None
+    await db.execute(
+        "DELETE FROM collection_reels WHERE collection_id = ? AND reel_id = ?",
+        (collection_id, reel_id),
+    )
+    await db.commit()
+    return await get_collection(db, collection_id)
+
+
+async def get_collection_analytics(db: aiosqlite.Connection, collection_id: int) -> dict | None:
+    coll = await get_collection(db, collection_id)
+    if not coll:
+        return None
+    reel_ids = await db.execute_fetchall(
+        "SELECT reel_id FROM collection_reels WHERE collection_id = ?", (collection_id,))
+    if not reel_ids:
+        return {
+            "collection_id": collection_id, "collection_name": coll["name"],
+            "total_reels": 0, "completed": 0, "failed": 0, "processing": 0,
+            "completion_rate": 0.0, "total_views": 0, "total_likes": 0,
+            "total_shares": 0, "engagement_rate": 0.0, "top_style": None,
+        }
+    ids = [r["reel_id"] for r in reel_ids]
+    placeholders = ",".join("?" * len(ids))
+    reels = await db.execute_fetchall(
+        f"SELECT * FROM reel_jobs WHERE id IN ({placeholders})", ids)
+    total = len(reels)
+    completed = sum(1 for r in reels if r["status"] == "completed")
+    failed = sum(1 for r in reels if r["status"] == "failed")
+    processing = sum(1 for r in reels if r["status"] == "processing")
+    style_counts: dict[str, int] = {}
+    for r in reels:
+        style_counts[r["style"]] = style_counts.get(r["style"], 0) + 1
+    top_style = max(style_counts, key=style_counts.get) if style_counts else None
+    # Engagement
+    eng = await db.execute_fetchall(
+        f"""SELECT event_type, COUNT(*) as cnt FROM engagement_events
+            WHERE reel_id IN ({placeholders}) GROUP BY event_type""", ids)
+    eng_counts = {e["event_type"]: e["cnt"] for e in eng}
+    views = eng_counts.get("view", 0)
+    likes = eng_counts.get("like", 0)
+    shares = eng_counts.get("share", 0)
+    clicks = eng_counts.get("click", 0)
+    saves = eng_counts.get("save", 0)
+    interactions = likes + shares + clicks + saves
+    eng_rate = round(interactions / views * 100, 1) if views > 0 else 0.0
+    return {
+        "collection_id": collection_id,
+        "collection_name": coll["name"],
+        "total_reels": total,
+        "completed": completed,
+        "failed": failed,
+        "processing": processing,
+        "completion_rate": round(completed / total * 100, 1) if total else 0.0,
+        "total_views": views,
+        "total_likes": likes,
+        "total_shares": shares,
+        "engagement_rate": eng_rate,
+        "top_style": top_style,
+    }
+
+
+# ── A/B Tests ──────────────────────────────────────────────────────────────
+
+async def create_ab_test(db: aiosqlite.Connection, data: dict) -> dict | str:
+    """Create an A/B test comparing multiple reels. Returns test or error string."""
+    reel_ids = data["reel_ids"]
+    for rid in reel_ids:
+        reel = await get_job(db, rid)
+        if not reel:
+            return f"reel_not_found:{rid}"
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO ab_tests (name, created_at) VALUES (?, ?)",
+        (data["name"], now),
+    )
+    test_id = cur.lastrowid
+    for rid in reel_ids:
+        await db.execute(
+            "INSERT INTO ab_test_reels (test_id, reel_id) VALUES (?, ?)",
+            (test_id, rid),
+        )
+    await db.commit()
+    return await get_ab_test(db, test_id)
+
+
+async def get_ab_test(db: aiosqlite.Connection, test_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests WHERE id = ?", (test_id,))
+    if not rows:
+        return None
+    test = rows[0]
+    reel_rows = await db.execute_fetchall(
+        "SELECT reel_id FROM ab_test_reels WHERE test_id = ?", (test_id,))
+    reels = []
+    best_rate = -1
+    winner_id = None
+    for rr in reel_rows:
+        rid = rr["reel_id"]
+        job = await get_job(db, rid)
+        eng = await get_reel_engagement(db, rid)
+        if not job:
+            continue
+        rate = eng["engagement_rate"] if eng else 0.0
+        reels.append({
+            "reel_id": rid,
+            "title": job["title"],
+            "style": job["style"],
+            "views": eng["views"] if eng else 0,
+            "likes": eng["likes"] if eng else 0,
+            "shares": eng["shares"] if eng else 0,
+            "clicks": eng["clicks"] if eng else 0,
+            "saves": eng["saves"] if eng else 0,
+            "engagement_rate": rate,
+            "is_winner": False,
+        })
+        if rate > best_rate:
+            best_rate = rate
+            winner_id = rid
+    # Mark winner (only if there's meaningful data)
+    has_data = any(r["views"] > 0 for r in reels)
+    if has_data and winner_id is not None:
+        for r in reels:
+            r["is_winner"] = r["reel_id"] == winner_id
+    else:
+        winner_id = None
+    return {
+        "id": test["id"],
+        "name": test["name"],
+        "status": test["status"],
+        "reels": reels,
+        "winner_id": winner_id,
+        "created_at": test["created_at"],
+    }
+
+
+async def list_ab_tests(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        test = await get_ab_test(db, r["id"])
+        if test:
+            result.append(test)
+    return result
+
+
+async def complete_ab_test(db: aiosqlite.Connection, test_id: int) -> dict | None:
+    test = await get_ab_test(db, test_id)
+    if not test:
+        return None
+    await db.execute(
+        "UPDATE ab_tests SET status = 'completed', winner_id = ? WHERE id = ?",
+        (test["winner_id"], test_id),
+    )
+    await db.commit()
+    return await get_ab_test(db, test_id)
+
+
+# ── Render Queue ───────────────────────────────────────────────────────────
+
+async def get_render_queue(db: aiosqlite.Connection) -> list[dict]:
+    """Get ordered render queue: queued jobs sorted by priority then creation time."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM reel_jobs WHERE status IN ('queued', 'processing') ORDER BY created_at ASC"
+    )
+    result = []
+    for r in rows:
+        priority = "normal"
+        try:
+            priority = r["priority"] or "normal"
+        except (IndexError, KeyError):
+            pass
+        result.append({
+            "id": r["id"],
+            "title": r["title"],
+            "style": r["style"],
+            "priority": priority,
+            "status": r["status"],
+            "created_at": r["created_at"],
+            "position": 0,
+        })
+    # Sort by priority order, then by creation time
+    result.sort(key=lambda x: (PRIORITY_ORDER.get(x["priority"], 2), x["created_at"]))
+    for i, item in enumerate(result):
+        item["position"] = i + 1
+    return result
