@@ -12,6 +12,7 @@ class ReelJob(BaseModel):
     status: str
     priority: str = "normal"
     brand_id: Optional[int] = None
+    tags: list[str] = Field(default_factory=list)
     output_url: Optional[str] = None
     duration_seconds: Optional[float] = None
     render_log: Optional[dict] = None
@@ -31,6 +32,7 @@ class CreateReelRequest(BaseModel):
     cta_text: Optional[str] = None
     duration_target: int = Field(15, ge=5, le=60)
     priority: str = Field("normal", description="low | normal | high | urgent")
+    tags: list[str] = Field(default_factory=list, description="Tags for organizing reels")
 
 
 class BatchCreateRequest(BaseModel):
@@ -66,6 +68,7 @@ class ReelListItem(BaseModel):
     status: str
     priority: str
     photo_count: int
+    tags: list[str] = Field(default_factory=list)
     created_at: str
 
 
@@ -116,6 +119,9 @@ class StatsResponse(BaseModel):
     most_used_ratio: Optional[str]
     total_brands: int
     total_collections: int
+    total_tags: int
+    total_webhooks: int
+    scheduled_count: int
 
 
 class RenderLogResponse(BaseModel):
@@ -268,3 +274,69 @@ class RenderQueueItem(BaseModel):
     status: str
     created_at: str
     position: int
+
+
+# ── Tags ────────────────────────────────────────────────────────────────────
+
+class TagRequest(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=50)
+
+
+class TagStats(BaseModel):
+    tag: str
+    count: int
+
+
+class TagAnalytics(BaseModel):
+    tag: str
+    total_reels: int
+    completed: int
+    failed: int
+    avg_engagement_rate: float
+    top_style: Optional[str]
+
+
+# ── Webhooks ────────────────────────────────────────────────────────────────
+
+VALID_WEBHOOK_EVENTS = {"render_complete", "render_failed", "all"}
+
+
+class WebhookCreate(BaseModel):
+    url: str = Field(..., min_length=10, max_length=500, description="Callback URL")
+    events: list[str] = Field(..., min_length=1, description="Events: render_complete | render_failed | all")
+    secret: Optional[str] = Field(None, max_length=200, description="HMAC secret for payload signing")
+
+
+class WebhookResponse(BaseModel):
+    id: int
+    url: str
+    events: list[str]
+    is_active: bool
+    deliveries: int
+    last_delivery_at: Optional[str]
+    created_at: str
+
+
+class WebhookUpdate(BaseModel):
+    url: Optional[str] = Field(None, min_length=10, max_length=500)
+    events: Optional[list[str]] = None
+    is_active: Optional[bool] = None
+
+
+# ── Scheduled Publishing ───────────────────────────────────────────────────
+
+class ScheduleCreate(BaseModel):
+    publish_at: str = Field(..., description="ISO datetime for scheduled publishing (YYYY-MM-DDTHH:MM:SS)")
+    platform: str = Field("instagram", description="Target: instagram | tiktok | youtube | facebook")
+    caption: Optional[str] = Field(None, max_length=2200)
+
+
+class ScheduleResponse(BaseModel):
+    id: int
+    reel_id: int
+    reel_title: str
+    publish_at: str
+    platform: str
+    caption: Optional[str]
+    status: str  # scheduled | published | cancelled
+    created_at: str

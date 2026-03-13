@@ -16,6 +16,9 @@ from models import (
     CollectionCreate, CollectionResponse, CollectionReelAdd, CollectionAnalytics,
     ABTestCreate, ABTestResponse,
     RenderQueueItem,
+    TagRequest, TagStats, TagAnalytics,
+    WebhookCreate, WebhookResponse, WebhookUpdate, VALID_WEBHOOK_EVENTS,
+    ScheduleCreate, ScheduleResponse,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
@@ -28,7 +31,10 @@ from engine import (
     create_collection, list_collections, get_collection, delete_collection,
     add_reel_to_collection, remove_reel_from_collection, get_collection_analytics,
     create_ab_test, get_ab_test, list_ab_tests, complete_ab_test,
-    get_render_queue, VALID_PRIORITIES,
+    get_render_queue, VALID_PRIORITIES, VALID_PLATFORMS,
+    add_tag, remove_tag, list_all_tags, get_tag_analytics,
+    create_webhook, list_webhooks, get_webhook, update_webhook, delete_webhook,
+    schedule_publish, list_scheduled, cancel_schedule,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -46,9 +52,10 @@ app = FastAPI(
     description=(
         "Product photo to marketing reel generator. Submit photos, choose style, "
         "get a ready-to-post reel. Supports brand profiles, collections, A/B testing, "
-        "engagement tracking, render queue with priorities, and analytics."
+        "engagement tracking, render queue with priorities, reel tags, webhooks, "
+        "scheduled publishing, and analytics."
     ),
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -56,7 +63,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "0.8.0"}
 
 
 # ── Brands ───────────────────────────────────────────────────────────────
@@ -98,7 +105,6 @@ async def remove_brand(brand_id: int):
 
 @app.post("/collections", response_model=CollectionResponse, status_code=201)
 async def add_collection(body: CollectionCreate):
-    """Create a collection to group reels for campaign tracking."""
     return await create_collection(app.state.db, body.model_dump())
 
 
@@ -124,7 +130,6 @@ async def remove_collection(collection_id: int):
 
 @app.post("/collections/{collection_id}/reels", response_model=CollectionResponse)
 async def collection_add_reel(collection_id: int, body: CollectionReelAdd):
-    """Add a reel to a collection."""
     result = await add_reel_to_collection(app.state.db, collection_id, body.reel_id)
     if result is None:
         raise HTTPException(404, "Collection not found")
@@ -135,7 +140,6 @@ async def collection_add_reel(collection_id: int, body: CollectionReelAdd):
 
 @app.delete("/collections/{collection_id}/reels/{reel_id}", response_model=CollectionResponse)
 async def collection_remove_reel(collection_id: int, reel_id: int):
-    """Remove a reel from a collection."""
     result = await remove_reel_from_collection(app.state.db, collection_id, reel_id)
     if not result:
         raise HTTPException(404, "Collection not found")
@@ -144,7 +148,6 @@ async def collection_remove_reel(collection_id: int, reel_id: int):
 
 @app.get("/collections/{collection_id}/analytics", response_model=CollectionAnalytics)
 async def collection_analytics(collection_id: int):
-    """Aggregated analytics for all reels in a collection."""
     result = await get_collection_analytics(app.state.db, collection_id)
     if not result:
         raise HTTPException(404, "Collection not found")
@@ -155,7 +158,6 @@ async def collection_analytics(collection_id: int):
 
 @app.post("/ab-tests", response_model=ABTestResponse, status_code=201)
 async def add_ab_test(body: ABTestCreate):
-    """Create an A/B test to compare engagement between multiple reels."""
     result = await create_ab_test(app.state.db, body.model_dump())
     if isinstance(result, str) and result.startswith("reel_not_found"):
         rid = result.split(":")[1]
@@ -178,7 +180,6 @@ async def get_ab_test_detail(test_id: int):
 
 @app.post("/ab-tests/{test_id}/complete", response_model=ABTestResponse)
 async def finalize_ab_test(test_id: int):
-    """Mark an A/B test as completed and lock in the winner."""
     result = await complete_ab_test(app.state.db, test_id)
     if not result:
         raise HTTPException(404, "A/B test not found")
@@ -189,8 +190,124 @@ async def finalize_ab_test(test_id: int):
 
 @app.get("/queue", response_model=list[RenderQueueItem])
 async def render_queue():
-    """View the current render queue ordered by priority and creation time."""
     return await get_render_queue(app.state.db)
+
+
+# ── Tags ─────────────────────────────────────────────────────────────────
+
+@app.post("/reels/{reel_id}/tags", status_code=201)
+async def tag_reel(reel_id: int, body: TagRequest):
+    """Add a tag to a reel for organization and filtering."""
+    result = await add_tag(app.state.db, reel_id, body.tag)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    return {"reel_id": reel_id, "tags": result}
+
+
+@app.delete("/reels/{reel_id}/tags/{tag}")
+async def untag_reel(reel_id: int, tag: str):
+    """Remove a tag from a reel."""
+    result = await remove_tag(app.state.db, reel_id, tag)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "tag_not_found":
+        raise HTTPException(404, "Tag not found on this reel")
+    return {"reel_id": reel_id, "tags": result}
+
+
+@app.get("/tags", response_model=list[TagStats])
+async def get_tags():
+    """List all tags with usage counts."""
+    return await list_all_tags(app.state.db)
+
+
+@app.get("/tags/{tag}/analytics", response_model=TagAnalytics)
+async def tag_analytics(tag: str):
+    """Get aggregated analytics for all reels with a specific tag."""
+    result = await get_tag_analytics(app.state.db, tag)
+    if not result:
+        raise HTTPException(404, "Tag not found or no reels tagged")
+    return result
+
+
+# ── Webhooks ─────────────────────────────────────────────────────────────
+
+@app.post("/webhooks", response_model=WebhookResponse, status_code=201)
+async def add_webhook(body: WebhookCreate):
+    """Register a webhook URL to receive notifications on render events."""
+    invalid = [e for e in body.events if e not in VALID_WEBHOOK_EVENTS]
+    if invalid:
+        raise HTTPException(422, f"Invalid events: {', '.join(invalid)}. Must be: {', '.join(sorted(VALID_WEBHOOK_EVENTS))}")
+    return await create_webhook(app.state.db, body.model_dump())
+
+
+@app.get("/webhooks", response_model=list[WebhookResponse])
+async def get_webhooks():
+    return await list_webhooks(app.state.db)
+
+
+@app.get("/webhooks/{wh_id}", response_model=WebhookResponse)
+async def get_webhook_detail(wh_id: int):
+    wh = await get_webhook(app.state.db, wh_id)
+    if not wh:
+        raise HTTPException(404, "Webhook not found")
+    return wh
+
+
+@app.patch("/webhooks/{wh_id}", response_model=WebhookResponse)
+async def patch_webhook(wh_id: int, body: WebhookUpdate):
+    """Update webhook URL, events, or active status."""
+    if body.events is not None:
+        invalid = [e for e in body.events if e not in VALID_WEBHOOK_EVENTS]
+        if invalid:
+            raise HTTPException(422, f"Invalid events: {', '.join(invalid)}")
+    result = await update_webhook(app.state.db, wh_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Webhook not found")
+    return result
+
+
+@app.delete("/webhooks/{wh_id}", status_code=204)
+async def remove_webhook(wh_id: int):
+    ok = await delete_webhook(app.state.db, wh_id)
+    if not ok:
+        raise HTTPException(404, "Webhook not found")
+
+
+# ── Scheduled Publishing ────────────────────────────────────────────────
+
+@app.post("/reels/{reel_id}/schedule", response_model=ScheduleResponse, status_code=201)
+async def schedule_reel(reel_id: int, body: ScheduleCreate):
+    """Schedule a completed reel for future publishing on a specific platform."""
+    result = await schedule_publish(app.state.db, reel_id, body.model_dump())
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "invalid_platform":
+        raise HTTPException(422, f"Invalid platform. Must be one of: {', '.join(sorted(VALID_PLATFORMS))}")
+    if result == "not_completed":
+        raise HTTPException(422, "Only completed reels can be scheduled for publishing")
+    if result == "already_scheduled":
+        raise HTTPException(409, "Reel already scheduled for this platform")
+    return result
+
+
+@app.get("/schedule", response_model=list[ScheduleResponse])
+async def get_schedule(
+    status: str | None = Query(None, description="Filter: scheduled | published | cancelled"),
+):
+    """View upcoming scheduled publishes."""
+    return await list_scheduled(app.state.db, status)
+
+
+@app.delete("/reels/{reel_id}/schedule", status_code=204)
+async def unschedule_reel(
+    reel_id: int,
+    platform: str | None = Query(None, description="Cancel for specific platform only"),
+):
+    """Cancel scheduled publishing for a reel."""
+    ok = await cancel_schedule(app.state.db, reel_id, platform)
+    if not ok:
+        raise HTTPException(404, "No active schedule found for this reel")
 
 
 # ── Reels ────────────────────────────────────────────────────────────────
@@ -212,7 +329,6 @@ async def create_reel(body: CreateReelRequest, background_tasks: BackgroundTasks
 
 @app.post("/reels/batch", response_model=list[ReelJob], status_code=201)
 async def create_reels_batch(body: BatchCreateRequest, background_tasks: BackgroundTasks):
-    """Create multiple reels from the same photo set with different styles — ideal for A/B testing."""
     invalid = [s for s in body.styles if s not in STYLE_CATALOG]
     if invalid:
         raise HTTPException(422, f"Unknown styles: {', '.join(invalid)}")
@@ -237,9 +353,10 @@ async def search_reels(
 @app.get("/reels", response_model=list[ReelListItem])
 async def list_reels(
     status: str | None = Query(None, description="queued | processing | completed | failed"),
+    tag: str | None = Query(None, description="Filter by tag"),
     limit: int = Query(50, ge=1, le=200),
 ):
-    return await list_jobs(app.state.db, status, limit)
+    return await list_jobs(app.state.db, status, tag, limit)
 
 
 @app.get("/reels/{job_id}/render-log", response_model=RenderLogResponse)
@@ -269,7 +386,6 @@ async def duplicate_reel(
     body: DuplicateReelRequest,
     background_tasks: BackgroundTasks,
 ):
-    """Clone an existing reel job with optional field overrides — perfect for A/B testing styles."""
     result = await duplicate_job(app.state.db, job_id, body.model_dump(exclude_none=True))
     if not result:
         raise HTTPException(404, "Reel job not found")
@@ -279,7 +395,6 @@ async def duplicate_reel(
 
 @app.post("/reels/{job_id}/engagement", response_model=EngagementSummary)
 async def log_engagement(job_id: int, body: EngagementEventCreate):
-    """Record an engagement event (view, like, share, click, save) for a reel."""
     if body.event_type not in VALID_ENGAGEMENT_TYPES:
         raise HTTPException(422, f"Invalid event_type. Must be one of: {', '.join(sorted(VALID_ENGAGEMENT_TYPES))}")
     result = await record_engagement(app.state.db, job_id, body.event_type, body.source)
