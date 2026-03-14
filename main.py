@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
@@ -27,6 +27,14 @@ from models import (
     ReelVersionResponse,
     CalendarSlotCreate, CalendarSlotUpdate, CalendarSlotResponse,
     CalendarOverview, CalendarGap,
+    # v1.1.0 — Watermarks
+    WatermarkCreate, WatermarkUpdate, WatermarkResponse,
+    VALID_WATERMARK_TYPES, VALID_WATERMARK_POSITIONS,
+    # v1.1.0 — Funnels
+    FunnelCreate, FunnelResponse, FunnelAnalysis, FunnelComparison,
+    # v1.1.0 — Asset Library
+    AssetCreate, AssetUpdate, AssetResponse, AssetUsageResponse, AssetStats,
+    VALID_ASSET_TYPES,
 )
 from engine import (
     init_db, create_job, batch_create_jobs, list_jobs, search_jobs,
@@ -58,6 +66,15 @@ from engine import (
     create_calendar_slot, list_calendar_slots, get_calendar_slot,
     update_calendar_slot, delete_calendar_slot,
     get_calendar_overview, get_calendar_gaps,
+    # v1.1.0 — Watermarks
+    create_watermark, list_watermarks, get_watermark, update_watermark,
+    delete_watermark, apply_watermark,
+    # v1.1.0 — Funnels
+    create_funnel, list_funnels, get_funnel, delete_funnel,
+    analyze_funnel, compare_funnels,
+    # v1.1.0 — Asset Library
+    create_asset, list_assets, get_asset, update_asset, delete_asset,
+    record_asset_usage, list_asset_usage, get_asset_stats,
 )
 
 DB_PATH = os.getenv("DB_PATH", "reelforge.db")
@@ -77,9 +94,10 @@ app = FastAPI(
         "get a ready-to-post reel. Supports brand profiles, collections, A/B testing, "
         "engagement tracking, render queue with priorities, reel tags, webhooks, "
         "scheduled publishing, reel templates, team comments, share links, "
-        "render profiles, reel versioning, content calendar, and analytics."
+        "render profiles, reel versioning, content calendar, watermarks, "
+        "analytics funnels, asset library, and analytics."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -87,7 +105,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.1.0"}
 
 
 # -- Brands ------------------------------------------------------------------
@@ -722,6 +740,225 @@ async def remove_calendar_slot(slot_id: int):
     ok = await delete_calendar_slot(app.state.db, slot_id)
     if not ok:
         raise HTTPException(404, "Calendar slot not found")
+
+
+# -- Watermark Management (v1.1.0) ------------------------------------------
+
+@app.post("/watermarks", response_model=WatermarkResponse, status_code=201)
+async def add_watermark(request: Request, body: WatermarkCreate):
+    """Create a watermark preset for branding reels."""
+    db = request.app.state.db
+    if body.watermark_type not in VALID_WATERMARK_TYPES:
+        raise HTTPException(
+            422,
+            f"Invalid watermark_type. Must be one of: {', '.join(sorted(VALID_WATERMARK_TYPES))}",
+        )
+    if body.position not in VALID_WATERMARK_POSITIONS:
+        raise HTTPException(
+            422,
+            f"Invalid position. Must be one of: {', '.join(sorted(VALID_WATERMARK_POSITIONS))}",
+        )
+    return await create_watermark(db, body.model_dump())
+
+
+@app.get("/watermarks", response_model=list[WatermarkResponse])
+async def get_watermarks(
+    request: Request,
+    brand_id: int | None = Query(None, description="Filter by brand ID"),
+):
+    """List all watermarks, optionally filtered by brand."""
+    db = request.app.state.db
+    return await list_watermarks(db, brand_id)
+
+
+@app.get("/watermarks/{wm_id}", response_model=WatermarkResponse)
+async def get_watermark_detail(request: Request, wm_id: int):
+    """Get a watermark by ID."""
+    db = request.app.state.db
+    wm = await get_watermark(db, wm_id)
+    if not wm:
+        raise HTTPException(404, "Watermark not found")
+    return wm
+
+
+@app.patch("/watermarks/{wm_id}", response_model=WatermarkResponse)
+async def patch_watermark(request: Request, wm_id: int, body: WatermarkUpdate):
+    """Update a watermark preset."""
+    db = request.app.state.db
+    if body.position is not None and body.position not in VALID_WATERMARK_POSITIONS:
+        raise HTTPException(
+            422,
+            f"Invalid position. Must be one of: {', '.join(sorted(VALID_WATERMARK_POSITIONS))}",
+        )
+    result = await update_watermark(db, wm_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Watermark not found")
+    return result
+
+
+@app.delete("/watermarks/{wm_id}", status_code=204)
+async def remove_watermark(request: Request, wm_id: int):
+    """Delete a watermark preset."""
+    db = request.app.state.db
+    ok = await delete_watermark(db, wm_id)
+    if not ok:
+        raise HTTPException(404, "Watermark not found")
+
+
+@app.post("/reels/{reel_id}/watermark/{wm_id}", response_model=WatermarkResponse)
+async def apply_watermark_to_reel(request: Request, reel_id: int, wm_id: int):
+    """Apply a watermark to a reel and increment times_applied."""
+    db = request.app.state.db
+    result = await apply_watermark(db, reel_id, wm_id)
+    if result is None:
+        raise HTTPException(404, "Reel not found")
+    if result == "watermark_not_found":
+        raise HTTPException(404, "Watermark not found")
+    return result
+
+
+# -- Reel Analytics Funnels (v1.1.0) ----------------------------------------
+# NOTE: /funnels/compare registered BEFORE /funnels/{funnel_id} to avoid routing conflicts
+
+@app.post("/funnels", response_model=FunnelResponse, status_code=201)
+async def add_funnel(request: Request, body: FunnelCreate):
+    """Create an analytics funnel to track engagement drop-off."""
+    db = request.app.state.db
+    return await create_funnel(db, body.model_dump())
+
+
+@app.get("/funnels/compare", response_model=FunnelComparison)
+async def compare_funnels_endpoint(
+    request: Request,
+    funnel_ids: str = Query(..., description="Comma-separated funnel IDs to compare"),
+):
+    """Compare multiple funnels side by side."""
+    db = request.app.state.db
+    ids = [int(fid.strip()) for fid in funnel_ids.split(",") if fid.strip()]
+    return await compare_funnels(db, ids)
+
+
+@app.get("/funnels", response_model=list[FunnelResponse])
+async def get_funnels(request: Request):
+    """List all analytics funnels."""
+    db = request.app.state.db
+    return await list_funnels(db)
+
+
+@app.get("/funnels/{funnel_id}", response_model=FunnelResponse)
+async def get_funnel_detail(request: Request, funnel_id: int):
+    """Get a funnel by ID."""
+    db = request.app.state.db
+    f = await get_funnel(db, funnel_id)
+    if not f:
+        raise HTTPException(404, "Funnel not found")
+    return f
+
+
+@app.delete("/funnels/{funnel_id}", status_code=204)
+async def remove_funnel(request: Request, funnel_id: int):
+    """Delete an analytics funnel."""
+    db = request.app.state.db
+    ok = await delete_funnel(db, funnel_id)
+    if not ok:
+        raise HTTPException(404, "Funnel not found")
+
+
+@app.get("/funnels/{funnel_id}/analyze", response_model=FunnelAnalysis)
+async def analyze_funnel_endpoint(request: Request, funnel_id: int):
+    """Analyze engagement events through funnel steps, showing drop-off at each stage."""
+    db = request.app.state.db
+    result = await analyze_funnel(db, funnel_id)
+    if not result:
+        raise HTTPException(404, "Funnel not found")
+    return result
+
+
+# -- Asset Library (v1.1.0) -------------------------------------------------
+# NOTE: /assets/stats registered BEFORE /assets/{asset_id} to avoid routing conflicts
+
+@app.post("/assets", response_model=AssetResponse, status_code=201)
+async def add_asset(request: Request, body: AssetCreate):
+    """Add a reusable asset (photo, music, overlay, etc.) to the library."""
+    db = request.app.state.db
+    if body.asset_type not in VALID_ASSET_TYPES:
+        raise HTTPException(
+            422,
+            f"Invalid asset_type. Must be one of: {', '.join(sorted(VALID_ASSET_TYPES))}",
+        )
+    return await create_asset(db, body.model_dump())
+
+
+@app.get("/assets/stats", response_model=AssetStats)
+async def asset_stats(request: Request):
+    """Get aggregated asset library statistics."""
+    db = request.app.state.db
+    return await get_asset_stats(db)
+
+
+@app.get("/assets", response_model=list[AssetResponse])
+async def get_assets(
+    request: Request,
+    asset_type: str | None = Query(None, description="Filter by asset type"),
+    brand_id: int | None = Query(None, description="Filter by brand ID"),
+    tag: str | None = Query(None, description="Filter by tag"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List assets with optional filters."""
+    db = request.app.state.db
+    return await list_assets(db, asset_type, brand_id, tag, limit, offset)
+
+
+@app.get("/assets/{asset_id}", response_model=AssetResponse)
+async def get_asset_detail(request: Request, asset_id: int):
+    """Get an asset by ID."""
+    db = request.app.state.db
+    a = await get_asset(db, asset_id)
+    if not a:
+        raise HTTPException(404, "Asset not found")
+    return a
+
+
+@app.patch("/assets/{asset_id}", response_model=AssetResponse)
+async def patch_asset(request: Request, asset_id: int, body: AssetUpdate):
+    """Update an asset's metadata."""
+    db = request.app.state.db
+    result = await update_asset(db, asset_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Asset not found")
+    return result
+
+
+@app.delete("/assets/{asset_id}", status_code=204)
+async def remove_asset(request: Request, asset_id: int):
+    """Delete an asset from the library."""
+    db = request.app.state.db
+    ok = await delete_asset(db, asset_id)
+    if not ok:
+        raise HTTPException(404, "Asset not found")
+
+
+@app.post("/assets/{asset_id}/use/{reel_id}", status_code=201)
+async def use_asset_in_reel(request: Request, asset_id: int, reel_id: int):
+    """Record that an asset was used in a reel and increment times_used."""
+    db = request.app.state.db
+    result = await record_asset_usage(db, asset_id, reel_id)
+    if result is None:
+        raise HTTPException(404, "Asset not found")
+    if result == "reel_not_found":
+        raise HTTPException(404, "Reel not found")
+    return result
+
+
+@app.get("/assets/{asset_id}/usage", response_model=list[AssetUsageResponse])
+async def get_asset_usage(request: Request, asset_id: int):
+    """List all reels that used this asset."""
+    db = request.app.state.db
+    result = await list_asset_usage(db, asset_id)
+    if result is None:
+        raise HTTPException(404, "Asset not found")
+    return result
 
 
 # -- Reels -------------------------------------------------------------------
