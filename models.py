@@ -571,3 +571,126 @@ class CalendarOverview(BaseModel):
 class CalendarGap(BaseModel):
     date: str
     missing_platforms: list[str]
+
+
+# -- Watermark Management (v1.1.0) ------------------------------------------
+
+VALID_WATERMARK_TYPES = {"text", "image"}
+VALID_WATERMARK_POSITIONS = {"top_left", "top_right", "bottom_left", "bottom_right", "center"}
+
+
+class WatermarkCreate(BaseModel):
+    name: str
+    watermark_type: str  # text or image
+    content: str  # text string or image URL
+    position: str = "bottom_right"
+    opacity: float = Field(default=0.7, ge=0.1, le=1.0)
+    scale: float = Field(default=1.0, ge=0.1, le=3.0)
+    brand_id: Optional[int] = None
+
+
+class WatermarkUpdate(BaseModel):
+    name: Optional[str] = None
+    content: Optional[str] = None
+    position: Optional[str] = None
+    opacity: Optional[float] = Field(default=None, ge=0.1, le=1.0)
+    scale: Optional[float] = Field(default=None, ge=0.1, le=3.0)
+    brand_id: Optional[int] = None
+
+
+class WatermarkResponse(BaseModel):
+    id: int
+    name: str
+    watermark_type: str
+    content: str
+    position: str
+    opacity: float
+    scale: float
+    brand_id: Optional[int]
+    times_applied: int
+    created_at: str
+    updated_at: str
+
+
+# -- Reel Analytics Funnels (v1.1.0) ----------------------------------------
+
+class FunnelCreate(BaseModel):
+    name: str
+    steps: list[str] = Field(default=["view", "like", "share", "click"])  # ordered event types
+    description: Optional[str] = None
+
+
+class FunnelResponse(BaseModel):
+    id: int
+    name: str
+    steps: list[str]
+    description: Optional[str]
+    created_at: str
+
+
+class FunnelStepMetric(BaseModel):
+    step: str
+    count: int
+    drop_off_pct: float
+
+
+class FunnelAnalysis(BaseModel):
+    funnel_id: int
+    funnel_name: str
+    steps: list[FunnelStepMetric]
+    overall_conversion_pct: float
+    total_entry: int
+    total_exit: int
+
+
+class FunnelComparison(BaseModel):
+    funnels: list[FunnelAnalysis]
+
+
+# -- Asset Library (v1.1.0) -------------------------------------------------
+
+VALID_ASSET_TYPES = {"photo", "music", "overlay", "background", "logo", "font"}
+
+
+class AssetCreate(BaseModel):
+    name: str
+    asset_type: str  # photo, music, overlay, background, logo, font
+    url: str
+    thumbnail_url: Optional[str] = None
+    file_size_kb: Optional[int] = None
+    tags: Optional[list[str]] = None
+    brand_id: Optional[int] = None
+
+
+class AssetUpdate(BaseModel):
+    name: Optional[str] = None
+    url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    tags: Optional[list[str]] = None
+
+
+class AssetResponse(BaseModel):
+    id: int
+    name: str
+    asset_type: str
+    url: str
+    thumbnail_url: Optional[str]
+    file_size_kb: Optional[int]
+    tags: list[str]
+    brand_id: Optional[int]
+    times_used: int
+    created_at: str
+    updated_at: str
+
+
+class AssetUsageResponse(BaseModel):
+    asset_id: int
+    reel_id: int
+    used_at: str
+
+
+class AssetStats(BaseModel):
+    total_assets: int
+    by_type: dict
+    total_usage: int
+    top_assets: list[dict]
