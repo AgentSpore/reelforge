@@ -41,6 +41,50 @@ CREATE TABLE IF NOT EXISTS brands (
     default_style TEXT NOT NULL DEFAULT 'dynamic',
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS watermarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    watermark_type TEXT NOT NULL DEFAULT 'text',
+    content TEXT NOT NULL,
+    position TEXT NOT NULL DEFAULT 'bottom_right',
+    opacity REAL NOT NULL DEFAULT 0.7,
+    scale REAL NOT NULL DEFAULT 1.0,
+    brand_id INTEGER REFERENCES brands(id),
+    times_applied INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS funnels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    steps TEXT NOT NULL DEFAULT '["view","like","share","click"]',
+    description TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    url TEXT NOT NULL,
+    thumbnail_url TEXT,
+    file_size_kb INTEGER,
+    tags TEXT NOT NULL DEFAULT '[]',
+    brand_id INTEGER REFERENCES brands(id),
+    times_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS asset_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL REFERENCES assets(id),
+    reel_id INTEGER NOT NULL REFERENCES reel_jobs(id),
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_asset_usage_asset ON asset_usage(asset_id);
+CREATE INDEX IF NOT EXISTS idx_asset_usage_reel ON asset_usage(reel_id);
+CREATE INDEX IF NOT EXISTS idx_watermarks_brand ON watermarks(brand_id);
+CREATE INDEX IF NOT EXISTS idx_assets_type ON assets(asset_type);
 """
 
 MIGRATION_BRAND_ID = "ALTER TABLE reel_jobs ADD COLUMN brand_id INTEGER;"
@@ -540,6 +584,34 @@ def _calendar_slot_row(r: aiosqlite.Row) -> dict:
         "status": r["status"],
         "created_at": r["created_at"],
         "updated_at": r["updated_at"],
+    }
+
+
+def _watermark_row(row):
+    return {
+        "id": row["id"], "name": row["name"], "watermark_type": row["watermark_type"],
+        "content": row["content"], "position": row["position"], "opacity": row["opacity"],
+        "scale": row["scale"], "brand_id": row["brand_id"], "times_applied": row["times_applied"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+
+def _funnel_row(row):
+    return {
+        "id": row["id"], "name": row["name"],
+        "steps": json.loads(row["steps"]) if isinstance(row["steps"], str) else row["steps"],
+        "description": row["description"], "created_at": row["created_at"],
+    }
+
+
+def _asset_row(row):
+    return {
+        "id": row["id"], "name": row["name"], "asset_type": row["asset_type"],
+        "url": row["url"], "thumbnail_url": row["thumbnail_url"],
+        "file_size_kb": row["file_size_kb"],
+        "tags": json.loads(row["tags"]) if isinstance(row["tags"], str) else row["tags"],
+        "brand_id": row["brand_id"], "times_used": row["times_used"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
     }
 
 
@@ -1047,13 +1119,21 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     sched_cnt = await db.execute_fetchall(
         "SELECT COUNT(*) as c FROM scheduled_publishes WHERE status = 'scheduled'")
     scheduled_count = sched_cnt[0]["c"] if sched_cnt else 0
+    wm_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM watermarks")
+    total_watermarks = wm_cnt[0]["c"] if wm_cnt else 0
+    fn_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM funnels")
+    total_funnels = fn_cnt[0]["c"] if fn_cnt else 0
+    as_cnt = await db.execute_fetchall("SELECT COUNT(*) as c FROM assets")
+    total_assets = as_cnt[0]["c"] if as_cnt else 0
 
     if not rows:
         return {"total_jobs": 0, "completed": 0, "processing": 0, "failed": 0,
                 "avg_duration_seconds": 0.0, "most_used_style": None, "most_used_ratio": None,
                 "total_brands": total_brands, "total_collections": total_collections,
                 "total_tags": total_tags, "total_webhooks": total_webhooks,
-                "scheduled_count": scheduled_count}
+                "scheduled_count": scheduled_count,
+                "total_watermarks": total_watermarks, "total_funnels": total_funnels,
+                "total_assets": total_assets}
     total = len(rows)
     completed = sum(1 for r in rows if r["status"] == "completed")
     processing = sum(1 for r in rows if r["status"] == "processing")
@@ -1076,6 +1156,9 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "total_tags": total_tags,
         "total_webhooks": total_webhooks,
         "scheduled_count": scheduled_count,
+        "total_watermarks": total_watermarks,
+        "total_funnels": total_funnels,
+        "total_assets": total_assets,
     }
 
 
@@ -2440,3 +2523,229 @@ async def get_calendar_gaps(db: aiosqlite.Connection, month: str,
             gaps.append({"date": date_str, "missing_platforms": missing})
 
     return gaps
+
+
+# --- v1.1.0 new functions below ---
+
+
+# =====================================================================
+# Watermark Management (v1.1.0)
+# =====================================================================
+
+
+async def create_watermark(db, data):
+    now = _now()
+    r = await db.execute(
+        "INSERT INTO watermarks (name, watermark_type, content, position, opacity, scale, brand_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (data["name"], data["watermark_type"], data["content"], data.get("position", "bottom_right"),
+         data.get("opacity", 0.7), data.get("scale", 1.0), data.get("brand_id"), now, now))
+    await db.commit()
+    return await get_watermark(db, r.lastrowid)
+
+
+async def list_watermarks(db, brand_id=None):
+    if brand_id:
+        r = await db.execute("SELECT * FROM watermarks WHERE brand_id=? ORDER BY created_at DESC", (brand_id,))
+    else:
+        r = await db.execute("SELECT * FROM watermarks ORDER BY created_at DESC")
+    return [_watermark_row(row) for row in await r.fetchall()]
+
+
+async def get_watermark(db, wm_id):
+    r = await db.execute("SELECT * FROM watermarks WHERE id=?", (wm_id,))
+    row = await r.fetchone()
+    return _watermark_row(row) if row else None
+
+
+async def update_watermark(db, wm_id, **kwargs):
+    wm = await get_watermark(db, wm_id)
+    if not wm:
+        return None
+    allowed = {"name", "content", "position", "opacity", "scale", "brand_id"}
+    sets, vals = [], []
+    for k, v in kwargs.items():
+        if k in allowed and v is not None:
+            sets.append(f"{k}=?"); vals.append(v)
+    if not sets:
+        return wm
+    sets.append("updated_at=?"); vals.append(_now()); vals.append(wm_id)
+    await db.execute(f"UPDATE watermarks SET {','.join(sets)} WHERE id=?", vals)
+    await db.commit()
+    return await get_watermark(db, wm_id)
+
+
+async def delete_watermark(db, wm_id):
+    r = await db.execute("DELETE FROM watermarks WHERE id=?", (wm_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def apply_watermark(db, reel_id, wm_id):
+    job = await get_job(db, reel_id)
+    if not job:
+        return None
+    wm = await get_watermark(db, wm_id)
+    if not wm:
+        return None
+    await db.execute("UPDATE watermarks SET times_applied=times_applied+1, updated_at=? WHERE id=?", (_now(), wm_id))
+    await db.commit()
+    return await get_watermark(db, wm_id)
+
+
+# =====================================================================
+# Funnels (v1.1.0)
+# =====================================================================
+
+
+async def create_funnel(db, data):
+    now = _now()
+    steps = json.dumps(data.get("steps", ["view", "like", "share", "click"]))
+    r = await db.execute(
+        "INSERT INTO funnels (name, steps, description, created_at) VALUES (?,?,?,?)",
+        (data["name"], steps, data.get("description"), now))
+    await db.commit()
+    return await get_funnel(db, r.lastrowid)
+
+
+async def list_funnels(db):
+    r = await db.execute("SELECT * FROM funnels ORDER BY created_at DESC")
+    return [_funnel_row(row) for row in await r.fetchall()]
+
+
+async def get_funnel(db, funnel_id):
+    r = await db.execute("SELECT * FROM funnels WHERE id=?", (funnel_id,))
+    row = await r.fetchone()
+    return _funnel_row(row) if row else None
+
+
+async def delete_funnel(db, funnel_id):
+    r = await db.execute("DELETE FROM funnels WHERE id=?", (funnel_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def analyze_funnel(db, funnel_id):
+    funnel = await get_funnel(db, funnel_id)
+    if not funnel:
+        return None
+    steps = funnel["steps"]
+    step_metrics = []
+    prev_count = None
+    for step in steps:
+        r = await db.execute("SELECT COUNT(DISTINCT reel_id) FROM engagement_events WHERE event_type=?", (step,))
+        count = (await r.fetchone())[0]
+        drop_off = 0.0
+        if prev_count is not None and prev_count > 0:
+            drop_off = round((1 - count / prev_count) * 100, 1)
+        step_metrics.append({"step": step, "count": count, "drop_off_pct": drop_off})
+        prev_count = count
+    total_entry = step_metrics[0]["count"] if step_metrics else 0
+    total_exit = step_metrics[-1]["count"] if step_metrics else 0
+    overall = round(total_exit / max(1, total_entry) * 100, 1)
+    return {
+        "funnel_id": funnel_id, "funnel_name": funnel["name"],
+        "steps": step_metrics, "overall_conversion_pct": overall,
+        "total_entry": total_entry, "total_exit": total_exit,
+    }
+
+
+async def compare_funnels(db, funnel_ids):
+    results = []
+    for fid in funnel_ids:
+        analysis = await analyze_funnel(db, fid)
+        if analysis:
+            results.append(analysis)
+    return {"funnels": results}
+
+
+# =====================================================================
+# Asset Library (v1.1.0)
+# =====================================================================
+
+
+async def create_asset(db, data):
+    now = _now()
+    tags = json.dumps(data.get("tags", []))
+    r = await db.execute(
+        "INSERT INTO assets (name, asset_type, url, thumbnail_url, file_size_kb, tags, brand_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (data["name"], data["asset_type"], data["url"], data.get("thumbnail_url"),
+         data.get("file_size_kb"), tags, data.get("brand_id"), now, now))
+    await db.commit()
+    return await get_asset(db, r.lastrowid)
+
+
+async def list_assets(db, asset_type=None, brand_id=None, tag=None, limit=50, offset=0):
+    clauses, vals = [], []
+    if asset_type:
+        clauses.append("asset_type=?"); vals.append(asset_type)
+    if brand_id:
+        clauses.append("brand_id=?"); vals.append(brand_id)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    r = await db.execute(f"SELECT * FROM assets{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", vals + [limit, offset])
+    rows = [_asset_row(row) for row in await r.fetchall()]
+    if tag:
+        rows = [a for a in rows if tag in a["tags"]]
+    return rows
+
+
+async def get_asset(db, asset_id):
+    r = await db.execute("SELECT * FROM assets WHERE id=?", (asset_id,))
+    row = await r.fetchone()
+    return _asset_row(row) if row else None
+
+
+async def update_asset(db, asset_id, **kwargs):
+    asset = await get_asset(db, asset_id)
+    if not asset:
+        return None
+    allowed = {"name", "url", "thumbnail_url"}
+    sets, vals = [], []
+    for k, v in kwargs.items():
+        if k in allowed and v is not None:
+            sets.append(f"{k}=?"); vals.append(v)
+    if "tags" in kwargs and kwargs["tags"] is not None:
+        sets.append("tags=?"); vals.append(json.dumps(kwargs["tags"]))
+    if not sets:
+        return asset
+    sets.append("updated_at=?"); vals.append(_now()); vals.append(asset_id)
+    await db.execute(f"UPDATE assets SET {','.join(sets)} WHERE id=?", vals)
+    await db.commit()
+    return await get_asset(db, asset_id)
+
+
+async def delete_asset(db, asset_id):
+    await db.execute("DELETE FROM asset_usage WHERE asset_id=?", (asset_id,))
+    r = await db.execute("DELETE FROM assets WHERE id=?", (asset_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def record_asset_usage(db, asset_id, reel_id):
+    asset = await get_asset(db, asset_id)
+    if not asset:
+        return None
+    job = await get_job(db, reel_id)
+    if not job:
+        return None
+    now = _now()
+    await db.execute("INSERT INTO asset_usage (asset_id, reel_id, used_at) VALUES (?,?,?)", (asset_id, reel_id, now))
+    await db.execute("UPDATE assets SET times_used=times_used+1, updated_at=? WHERE id=?", (now, asset_id))
+    await db.commit()
+    return {"asset_id": asset_id, "reel_id": reel_id, "used_at": now}
+
+
+async def list_asset_usage(db, asset_id):
+    r = await db.execute("SELECT * FROM asset_usage WHERE asset_id=? ORDER BY used_at DESC", (asset_id,))
+    return [{"asset_id": row["asset_id"], "reel_id": row["reel_id"], "used_at": row["used_at"]} for row in await r.fetchall()]
+
+
+async def get_asset_stats(db):
+    r = await db.execute("SELECT COUNT(*) FROM assets")
+    total = (await r.fetchone())[0]
+    r2 = await db.execute("SELECT asset_type, COUNT(*) as cnt FROM assets GROUP BY asset_type")
+    by_type = {row["asset_type"]: row["cnt"] for row in await r2.fetchall()}
+    r3 = await db.execute("SELECT SUM(times_used) FROM assets")
+    total_usage = (await r3.fetchone())[0] or 0
+    r4 = await db.execute("SELECT id, name, asset_type, times_used FROM assets ORDER BY times_used DESC LIMIT 10")
+    top = [{"id": row["id"], "name": row["name"], "asset_type": row["asset_type"], "times_used": row["times_used"]} for row in await r4.fetchall()]
+    return {"total_assets": total, "by_type": by_type, "total_usage": total_usage, "top_assets": top}
